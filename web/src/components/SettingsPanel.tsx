@@ -9,6 +9,8 @@ export interface DubbingSettings {
     use_chatterbox: boolean;
     use_elevenlabs: boolean;
     use_edge_tts: boolean;
+    prefer_youtube_subs: boolean;
+    multi_speaker: boolean;
 }
 
 interface SettingsPanelProps {
@@ -46,6 +48,46 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
 
             {open && (
                 <div className="px-5 pb-5 space-y-5 animate-slide-up border-t border-border pt-4">
+                    {/* YouTube Subtitles */}
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <p className="text-sm text-text-primary">Use YouTube Subtitles</p>
+                            <p className="text-xs text-text-muted">Skip Whisper, use existing subs (faster, no GPU for transcription)</p>
+                        </div>
+                        <button
+                            onClick={() => update({ prefer_youtube_subs: !settings.prefer_youtube_subs })}
+                            className={`
+                                w-11 h-6 rounded-full transition-colors relative
+                                ${settings.prefer_youtube_subs ? 'bg-primary' : 'bg-white/10'}
+                            `}
+                        >
+                            <div className={`
+                                w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                ${settings.prefer_youtube_subs ? 'translate-x-6' : 'translate-x-1'}
+                            `} />
+                        </button>
+                    </div>
+
+                    {/* Multi-Speaker Voices */}
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <p className="text-sm text-text-primary">Multi-Speaker Voices</p>
+                            <p className="text-xs text-text-muted">Detect speakers & assign distinct voices (needs HF_TOKEN, adds ~30s)</p>
+                        </div>
+                        <button
+                            onClick={() => update({ multi_speaker: !settings.multi_speaker })}
+                            className={`
+                                w-11 h-6 rounded-full transition-colors relative
+                                ${settings.multi_speaker ? 'bg-primary' : 'bg-white/10'}
+                            `}
+                        >
+                            <div className={`
+                                w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                ${settings.multi_speaker ? 'translate-x-6' : 'translate-x-1'}
+                            `} />
+                        </button>
+                    </div>
+
                     {/* TTS Engines */}
                     <div>
                         <p className="text-sm font-medium text-text-primary mb-3">TTS Engines</p>

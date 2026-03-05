@@ -14,12 +14,14 @@ export default function HomePage() {
     const [sourceLanguage, setSourceLanguage] = useState('auto');
     const [targetLanguage, setTargetLanguage] = useState('hi');
     const [settings, setSettings] = useState<DubbingSettings>({
-        tts_rate: '+0%',
+        tts_rate: '+100%',
         mix_original: false,
         original_volume: 0.10,
         use_chatterbox: true,
         use_elevenlabs: false,
         use_edge_tts: false,
+        prefer_youtube_subs: false,
+        multi_speaker: false,
     });
     const [submitting, setSubmitting] = useState(false);
     const [error, setError] = useState<string | null>(null);

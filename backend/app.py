@@ -69,6 +69,8 @@ class JobCreateRequest(BaseModel):
     use_chatterbox: bool = True
     use_elevenlabs: bool = False
     use_edge_tts: bool = False
+    prefer_youtube_subs: bool = False
+    multi_speaker: bool = False
 
 
 # ── Step weights for overall progress ────────────────────────────────────────
@@ -168,6 +170,8 @@ def _run_job(job: Job, req: JobCreateRequest):
             use_chatterbox=req.use_chatterbox,
             use_elevenlabs=req.use_elevenlabs,
             use_edge_tts=req.use_edge_tts,
+            prefer_youtube_subs=req.prefer_youtube_subs,
+            multi_speaker=req.multi_speaker,
         )
 
         pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job))
@@ -253,6 +257,8 @@ async def create_job_upload(
     use_chatterbox: bool = Form(True),
     use_elevenlabs: bool = Form(False),
     use_edge_tts: bool = Form(False),
+    prefer_youtube_subs: bool = Form(False),
+    multi_speaker: bool = Form(False),
 ):
     """Create a dubbing job from an uploaded video file."""
     if not file.filename:
@@ -284,6 +290,8 @@ async def create_job_upload(
         use_chatterbox=use_chatterbox,
         use_elevenlabs=use_elevenlabs,
         use_edge_tts=use_edge_tts,
+        prefer_youtube_subs=prefer_youtube_subs,
+        multi_speaker=multi_speaker,
     )
 
     t = threading.Thread(target=_run_job, args=(job, req), daemon=True)

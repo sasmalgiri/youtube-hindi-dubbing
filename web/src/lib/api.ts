@@ -27,6 +27,8 @@ export interface JobCreateRequest {
     use_chatterbox?: boolean;
     use_elevenlabs?: boolean;
     use_edge_tts?: boolean;
+    prefer_youtube_subs?: boolean;
+    multi_speaker?: boolean;
 }
 
 export interface JobStatus {
