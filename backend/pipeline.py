@@ -257,6 +257,9 @@ class Pipeline:
         if sys.platform == "win32":
             # 3. Scan WinGet packages directory
             localappdata = os.environ.get("LOCALAPPDATA", "")
+            if not localappdata:
+                userprofile = os.environ.get("USERPROFILE", str(Path.home()))
+                localappdata = str(Path(userprofile) / "AppData" / "Local")
             if localappdata:
                 winget_pkgs = Path(localappdata) / "Microsoft" / "WinGet" / "Packages"
                 if winget_pkgs.exists():
@@ -569,6 +572,10 @@ class Pipeline:
         # Also scan WinGet install paths as last resort
         if resolved == "ffmpeg" and sys.platform == "win32":
             localappdata = os.environ.get("LOCALAPPDATA", "")
+            # Fallback: derive LOCALAPPDATA from USERPROFILE if not set
+            if not localappdata:
+                userprofile = os.environ.get("USERPROFILE", str(Path.home()))
+                localappdata = str(Path(userprofile) / "AppData" / "Local")
             winget_ffmpeg = Path(localappdata) / "Microsoft" / "WinGet" / "Packages"
             if winget_ffmpeg.exists():
                 for exe in winget_ffmpeg.rglob("ffmpeg.exe"):
@@ -603,9 +610,13 @@ class Pipeline:
             cookies_file = self._find_cookies_file()
             cookies_args = ["--cookies", cookies_file] if cookies_file else []
 
+            # Enable Node.js runtime for YouTube extraction (required since yt-dlp 2025+)
+            node_path = self._find_executable("node")
+            js_args = ["--js-runtimes", f"node:{node_path}"] if node_path else []
+
             # Get video title first
             try:
-                title_cmd = [self._ytdlp, "--print", "%(title)s", "--no-download"] + cookies_args + [src]
+                title_cmd = [self._ytdlp, "--print", "%(title)s", "--no-download"] + cookies_args + js_args + [src]
                 title_result = subprocess.run(
                     title_cmd, capture_output=True, text=True, timeout=30,
                 )
@@ -620,15 +631,23 @@ class Pipeline:
             try:
                 dl_cmd = [
                     self._ytdlp,
-                    "--ffmpeg-location", str(Path(self._ffmpeg).parent),
                     "-f", "bv*+ba/b",
                     "--merge-output-format", "mp4",
                     "-o", out_tpl,
-                ] + cookies_args + [src]
-                subprocess.run(dl_cmd, check=True, capture_output=True)
-            except subprocess.CalledProcessError as e:
-                stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "Unknown error")
-                raise RuntimeError(f"yt-dlp failed: {stderr}") from e
+                ]
+                # Only add --ffmpeg-location if we have a real path (not bare "ffmpeg")
+                ffmpeg_path = Path(self._ffmpeg)
+                if ffmpeg_path.is_absolute():
+                    dl_cmd += ["--ffmpeg-location", str(ffmpeg_path.parent)]
+                dl_cmd += cookies_args + js_args + [src]
+                result = subprocess.run(dl_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    error_msg = (result.stderr or result.stdout or "Unknown error").strip()
+                    raise RuntimeError(f"yt-dlp failed: {error_msg}")
+            except RuntimeError:
+                raise
+            except Exception as e:
+                raise RuntimeError(f"yt-dlp failed: {e}") from e
 
             # Find downloaded file
             mp4 = list(self.cfg.work_dir.glob("source.mp4"))
