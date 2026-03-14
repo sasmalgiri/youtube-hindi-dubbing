@@ -56,6 +56,7 @@ class Job:
     segments: List[Dict] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     events: List[Dict] = field(default_factory=list)
+    original_req: Optional[Any] = None  # Store original request for resume
 
 
 class JobCreateRequest(BaseModel):
@@ -203,6 +204,8 @@ def _run_job(job: Job, req: JobCreateRequest):
         job.events.append({"type": "complete", "state": "done"})
 
     except Exception as e:
+        import traceback, logging
+        logging.error(f"[JOB ERROR] {e}\n{traceback.format_exc()}")
         job.state = "error"
         job.error = str(e)
         job.message = f"Error: {e}"
@@ -252,6 +255,7 @@ def create_job(req: JobCreateRequest):
 
     job_id = uuid.uuid4().hex[:12]
     job = Job(id=job_id, source_url=url, target_language=req.target_language)
+    job.original_req = req
     JOBS[job_id] = job
 
     t = threading.Thread(target=_run_job, args=(job, req), daemon=True)
@@ -275,6 +279,8 @@ async def create_job_upload(
     use_edge_tts: bool = Form(False),
     prefer_youtube_subs: bool = Form(False),
     multi_speaker: bool = Form(False),
+    transcribe_only: bool = Form(False),
+    voice: str = Form("hi-IN-SwaraNeural"),
 ):
     """Create a dubbing job from an uploaded video file."""
     if not file.filename:
@@ -300,6 +306,7 @@ async def create_job_upload(
         url=str(saved_path),
         source_language=source_language,
         target_language=target_language,
+        voice=voice,
         tts_rate=tts_rate,
         mix_original=mix_original,
         original_volume=original_volume,
@@ -310,7 +317,9 @@ async def create_job_upload(
         use_edge_tts=use_edge_tts,
         prefer_youtube_subs=prefer_youtube_subs,
         multi_speaker=multi_speaker,
+        transcribe_only=transcribe_only,
     )
+    job.original_req = req
 
     t = threading.Thread(target=_run_job, args=(job, req), daemon=True)
     t.start()
@@ -433,11 +442,22 @@ def _run_resume(job: Job):
         out_path = job_dir / "dubbed.mp4"
         translated_srt = work_dir / "translated_upload.srt"
 
+        # Restore TTS settings from original request
+        req = job.original_req
         cfg = PipelineConfig(
             source="resume",
             work_dir=work_dir,
             output_path=out_path,
             target_language=job.target_language,
+            tts_voice=req.voice if req else "hi-IN-SwaraNeural",
+            tts_rate=req.tts_rate if req else "+0%",
+            use_chatterbox=req.use_chatterbox if req else False,
+            use_elevenlabs=req.use_elevenlabs if req else False,
+            use_google_tts=req.use_google_tts if req else False,
+            use_coqui_xtts=req.use_coqui_xtts if req else False,
+            use_edge_tts=req.use_edge_tts if req else True,
+            mix_original=req.mix_original if req else False,
+            original_volume=req.original_volume if req else 0.10,
         )
 
         pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job))
@@ -447,6 +467,7 @@ def _run_resume(job: Job):
             raise RuntimeError("Pipeline finished but output file not found")
 
         job.result_path = out_path
+        job.segments = pipeline.segments
         job.video_title = job.video_title or "Untitled"
         job.overall_progress = 1.0
         job.state = "done"
@@ -454,6 +475,8 @@ def _run_resume(job: Job):
         job.events.append({"type": "complete", "state": "done"})
 
     except Exception as e:
+        import traceback, logging
+        logging.error(f"[RESUME ERROR] {e}\n{traceback.format_exc()}")
         job.state = "error"
         job.error = str(e)
         job.message = f"Error: {e}"

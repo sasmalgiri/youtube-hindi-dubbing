@@ -49,7 +49,7 @@ export function useJobProgress(jobId: string | null): JobProgress {
                     if (pollRef.current) clearInterval(pollRef.current);
                 } else if (job.state === 'waiting_for_srt') {
                     setIsWaitingForSrt(true);
-                    setOverallProgress(1);
+                    setOverallProgress(0.4);
                     if (pollRef.current) clearInterval(pollRef.current);
                 }
             } catch {
@@ -86,7 +86,7 @@ export function useJobProgress(jobId: string | null): JobProgress {
                         setError(event.error || 'Unknown error');
                     } else if (event.state === 'waiting_for_srt') {
                         setIsWaitingForSrt(true);
-                        setOverallProgress(1);
+                        setOverallProgress(0.4);
                         setMessage('Transcription complete. Download SRT and upload translation.');
                     }
                     // Fetch final status
@@ -113,6 +113,10 @@ export function useJobProgress(jobId: string | null): JobProgress {
 
     const restart = useCallback(() => {
         if (!jobId) return;
+        // Clean up previous SSE/polling before starting new one
+        if (unsubRef.current) unsubRef.current();
+        if (pollRef.current) clearInterval(pollRef.current);
+
         setIsComplete(false);
         setIsError(false);
         setIsWaitingForSrt(false);
@@ -133,6 +137,10 @@ export function useJobProgress(jobId: string | null): JobProgress {
                     } else if (event.state === 'error') {
                         setIsError(true);
                         setError(event.error || 'Unknown error');
+                    } else if (event.state === 'waiting_for_srt') {
+                        setIsWaitingForSrt(true);
+                        setOverallProgress(0.4);
+                        setMessage('Transcription complete. Download SRT and upload translation.');
                     }
                     getJob(jobId).then(setStatus).catch(() => {});
                     return;

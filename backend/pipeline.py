@@ -560,6 +560,8 @@ class Pipeline:
         self._report("synthesize", 0.0,
                      f"Generating natural speech ({self.cfg.tts_voice})...")
         tts_data = self._generate_tts_natural(text_segments)
+        if not tts_data:
+            raise RuntimeError("TTS synthesis produced no audio segments — check TTS engine settings")
         self._report("synthesize", 0.9,
                      f"Generated {len(tts_data)} segments, speeding up to 1.25x...")
 
@@ -595,6 +597,7 @@ class Pipeline:
         from srt_utils import parse_srt
 
         self._ensure_ffmpeg()
+        self._voice_map = None  # No multi-speaker in resume mode
 
         # Load translated segments
         self._report("translate", 0.0, "Loading uploaded translated SRT...")
@@ -632,6 +635,8 @@ class Pipeline:
         self._report("synthesize", 0.0,
                      f"Generating natural speech ({self.cfg.tts_voice})...")
         tts_data = self._generate_tts_natural(text_segments)
+        if not tts_data:
+            raise RuntimeError("TTS synthesis produced no audio segments — check TTS engine settings")
         self._report("synthesize", 0.9,
                      f"Generated {len(tts_data)} segments, speeding up to 1.25x...")
 
@@ -1026,7 +1031,7 @@ class Pipeline:
                         model="gemini-2.5-pro",
                         contents=prompt,
                     )
-                    translated_parts.append(response.text.strip())
+                    translated_parts.append((response.text or "").strip())
                     break
                 except Exception as e:
                     if attempt < retries - 1:
@@ -1812,7 +1817,8 @@ class Pipeline:
                         # Concatenate slowed clip + frozen frame clip
                         concat_list = self.cfg.work_dir / f"adapt_{idx:04d}_concat.txt"
                         concat_list.write_text(
-                            f"file '{slowed_clip}'\nfile '{freeze_clip}'\n"
+                            f"file '{str(slowed_clip).replace(chr(92), '/')}'\n"
+                            f"file '{str(freeze_clip).replace(chr(92), '/')}'\n"
                         )
                         subprocess.run(
                             [self._ffmpeg, "-y",
@@ -1915,6 +1921,8 @@ class Pipeline:
                 self._report("synthesize", 0.05, "Using Coqui XTTS v2 (GPU, voice cloning)...")
                 return self._tts_coqui_xtts(segments)
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 self._report("synthesize", 0.05,
                              f"Coqui XTTS failed ({e}) — falling back...")
 
@@ -2184,6 +2192,8 @@ class Pipeline:
         """
         import torch
         import torchaudio
+        # Accept Coqui TOS automatically (non-interactive server environment)
+        os.environ["COQUI_TOS_AGREED"] = "1"
         from TTS.api import TTS
 
         self._report("synthesize", 0.02, "Loading XTTS v2 model on GPU (this may take a minute)...")
@@ -2579,9 +2589,13 @@ class Pipeline:
     # ── Duration & tempo adjustment ───────────────────────────────────────
     def _get_duration(self, media_path: Path) -> float:
         """Get duration of a media file in seconds using ffprobe."""
-        ffprobe = str(Path(self._ffmpeg).parent / "ffprobe")
-        if sys.platform == "win32" and not ffprobe.endswith(".exe"):
-            ffprobe += ".exe"
+        ffmpeg_path = Path(self._ffmpeg)
+        if ffmpeg_path.is_absolute():
+            ffprobe = str(ffmpeg_path.parent / "ffprobe")
+            if sys.platform == "win32" and not ffprobe.endswith(".exe"):
+                ffprobe += ".exe"
+        else:
+            ffprobe = shutil.which("ffprobe") or "ffprobe"
         try:
             result = subprocess.run(
                 [ffprobe, "-v", "quiet", "-show_entries", "format=duration",

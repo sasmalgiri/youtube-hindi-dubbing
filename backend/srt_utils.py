@@ -30,7 +30,11 @@ def parse_srt(srt_path: Path, text_key: str = "text_translated") -> List[Dict]:
         end = _parse_time(ts_match.group(2))
         text = " ".join(lines[2:]).strip()
         if text:
-            segments.append({"start": start, "end": end, text_key: text})
+            seg = {"start": start, "end": end, text_key: text}
+            # Also set "text" key so downstream code that accesses seg["text"] works
+            if text_key != "text":
+                seg["text"] = text
+            segments.append(seg)
     return segments
 
 

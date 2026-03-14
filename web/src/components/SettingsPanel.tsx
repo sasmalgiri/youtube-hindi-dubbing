@@ -227,7 +227,7 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                             type="range"
                             min={-50}
                             max={50}
-                            value={parseInt(settings.tts_rate)}
+                            value={parseInt(settings.tts_rate) || 0}
                             onChange={(e) => {
                                 const v = parseInt(e.target.value);
                                 update({ tts_rate: `${v >= 0 ? '+' : ''}${v}%` });
