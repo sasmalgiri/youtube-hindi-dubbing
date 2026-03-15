@@ -490,6 +490,92 @@ class Pipeline:
 
         return voice_map
 
+    def _save_speaker_refs(self, audio_raw: Path, segments: List[Dict]):
+        """Extract and save per-speaker voice reference clips for Coqui XTTS.
+
+        Combines multiple short segments from each speaker into a single
+        10-15 second reference clip for voice cloning.
+        """
+        refs_dir = self.cfg.work_dir / "speaker_refs"
+        refs_dir.mkdir(exist_ok=True)
+
+        # Group segments by speaker
+        speaker_segs: Dict[str, List[Dict]] = {}
+        for seg in segments:
+            spk = seg.get("speaker_id")
+            if spk:
+                speaker_segs.setdefault(spk, []).append(seg)
+
+        if not speaker_segs:
+            return
+
+        self._report("transcribe", 0.92,
+                     f"Saving voice references for {len(speaker_segs)} speakers...")
+
+        for spk, segs in speaker_segs.items():
+            # Sort by start time and collect up to ~15 seconds of audio
+            segs_sorted = sorted(segs, key=lambda s: s["start"])
+            total_dur = 0.0
+            clip_parts = []
+            concat_txt = refs_dir / f"{spk}_concat.txt"
+
+            for seg in segs_sorted:
+                if total_dur >= 15.0:
+                    break
+                dur = seg["end"] - seg["start"]
+                if dur < 0.5:
+                    continue
+                # Extract this segment's audio
+                clip_path = refs_dir / f"{spk}_clip_{len(clip_parts):03d}.wav"
+                try:
+                    subprocess.run(
+                        [self._ffmpeg, "-y",
+                         "-i", str(audio_raw),
+                         "-ss", f"{seg['start']:.3f}",
+                         "-t", f"{dur:.3f}",
+                         "-ar", "22050", "-ac", "1",
+                         str(clip_path)],
+                        check=True, capture_output=True,
+                    )
+                    clip_parts.append(clip_path)
+                    total_dur += dur
+                except Exception:
+                    continue
+
+            if not clip_parts:
+                continue
+
+            # Concatenate clips into one reference file
+            ref_path = refs_dir / f"{spk}.wav"
+            if len(clip_parts) == 1:
+                shutil.copy2(clip_parts[0], ref_path)
+            else:
+                concat_txt.write_text(
+                    "\n".join(f"file '{str(c).replace(chr(92), '/')}'" for c in clip_parts),
+                    encoding="utf-8",
+                )
+                try:
+                    subprocess.run(
+                        [self._ffmpeg, "-y",
+                         "-f", "concat", "-safe", "0",
+                         "-i", str(concat_txt),
+                         "-ar", "22050", "-ac", "1",
+                         str(ref_path)],
+                        check=True, capture_output=True,
+                    )
+                except Exception:
+                    # Fall back to just the first clip
+                    shutil.copy2(clip_parts[0], ref_path)
+
+            # Clean up individual clips
+            for c in clip_parts:
+                c.unlink(missing_ok=True)
+            concat_txt.unlink(missing_ok=True)
+
+        saved = list(refs_dir.glob("SPEAKER_*.wav"))
+        self._report("transcribe", 0.95,
+                     f"Saved {len(saved)} speaker voice references for XTTS voice cloning")
+
     # ── Main entry ───────────────────────────────────────────────────────
     def run(self):
         """Execute the full dubbing pipeline."""
@@ -533,16 +619,24 @@ class Pipeline:
             if speaker_genders and speaker_ranges:
                 self._assign_speaker_to_segments(text_segments, speaker_ranges)
                 self._voice_map = self._assign_voices_to_speakers(speaker_genders)
+                # Save per-speaker voice refs for Coqui XTTS voice cloning
+                if self.cfg.use_coqui_xtts:
+                    self._save_speaker_refs(audio_raw, text_segments)
                 self._report("transcribe", 0.99,
                              f"Assigned {len(self._voice_map)} distinct voices")
 
-        # Transcribe-only mode: save source SRT and stop
+        # Transcribe-only mode: save source SRT, extract per-speaker refs, and stop
         if self.cfg.transcribe_only:
             from srt_utils import write_srt as _write_srt
             source_srt = self.cfg.work_dir / "transcript_source.srt"
             has_speakers = any("speaker_id" in s for s in text_segments)
             _write_srt(text_segments, source_srt, text_key="text",
                        include_speaker=has_speakers)
+
+            # Save per-speaker voice reference clips for Coqui XTTS voice cloning
+            if has_speakers:
+                self._save_speaker_refs(audio_raw, text_segments)
+
             speaker_note = f" ({len(set(s.get('speaker_id','') for s in text_segments if s.get('speaker_id')))} speakers detected)" if has_speakers else ""
             self._report("transcribe", 1.0,
                          f"Transcription complete — {len(text_segments)} segments{speaker_note}. Download SRT to translate.")
@@ -2251,7 +2345,18 @@ class Pipeline:
         finally:
             torch.load = _original_torch_load  # Restore original
 
-        # Use original audio as speaker reference for voice cloning
+        # Build per-speaker reference map if available
+        refs_dir = self.cfg.work_dir / "speaker_refs"
+        speaker_ref_map: Dict[str, Path] = {}
+        if refs_dir.exists():
+            for ref_file in refs_dir.glob("SPEAKER_*.wav"):
+                spk_id = ref_file.stem  # e.g. "SPEAKER_00"
+                speaker_ref_map[spk_id] = ref_file
+            if speaker_ref_map:
+                self._report("synthesize", 0.04,
+                             f"Found {len(speaker_ref_map)} per-speaker voice references for cloning")
+
+        # Default reference: single voice from original audio
         ref_wav = self.cfg.work_dir / "voice_ref.wav"
         audio_raw = self.cfg.work_dir / "audio_raw.wav"
         if not ref_wav.exists() and audio_raw.exists():
@@ -2271,7 +2376,7 @@ class Pipeline:
                 ref_wav = ref_files[0]
                 self._report("synthesize", 0.05, f"Using custom voice reference: {ref_wav.name}")
 
-        if not ref_wav.exists():
+        if not ref_wav.exists() and not speaker_ref_map:
             raise RuntimeError("No voice reference available for XTTS voice cloning")
 
         # Map language codes for XTTS
@@ -2292,10 +2397,14 @@ class Pipeline:
 
             wav_path = self.cfg.work_dir / f"tts_{i:04d}.wav"
 
+            # Pick per-speaker reference if available, else default
+            spk_id = seg.get("speaker_id", "")
+            seg_ref = speaker_ref_map.get(spk_id, ref_wav) if speaker_ref_map else ref_wav
+
             try:
                 tts_model.tts_to_file(
                     text=text,
-                    speaker_wav=str(ref_wav),
+                    speaker_wav=str(seg_ref),
                     language=xtts_lang,
                     file_path=str(wav_path),
                 )
