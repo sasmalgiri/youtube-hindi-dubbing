@@ -540,9 +540,12 @@ class Pipeline:
         if self.cfg.transcribe_only:
             from srt_utils import write_srt as _write_srt
             source_srt = self.cfg.work_dir / "transcript_source.srt"
-            _write_srt(text_segments, source_srt, text_key="text")
+            has_speakers = any("speaker_id" in s for s in text_segments)
+            _write_srt(text_segments, source_srt, text_key="text",
+                       include_speaker=has_speakers)
+            speaker_note = f" ({len(set(s.get('speaker_id','') for s in text_segments if s.get('speaker_id')))} speakers detected)" if has_speakers else ""
             self._report("transcribe", 1.0,
-                         f"Transcription complete — {len(text_segments)} segments. Download SRT to translate.")
+                         f"Transcription complete — {len(text_segments)} segments{speaker_note}. Download SRT to translate.")
             return  # Pipeline pauses here; user translates externally
 
         # Step 4: Translate each segment (preserving timestamps for scene sync)
@@ -597,7 +600,6 @@ class Pipeline:
         from srt_utils import parse_srt
 
         self._ensure_ffmpeg()
-        self._voice_map = None  # No multi-speaker in resume mode
 
         # Load translated segments
         self._report("translate", 0.0, "Loading uploaded translated SRT...")
@@ -606,6 +608,41 @@ class Pipeline:
             raise RuntimeError("Uploaded SRT is empty or invalid")
 
         self.segments = translated
+
+        # Check for speaker labels from SRT and rebuild voice map
+        speakers_found = set(s.get("speaker_id") for s in translated if s.get("speaker_id"))
+        if speakers_found and self.cfg.multi_speaker:
+            self._report("translate", 0.5,
+                         f"Found {len(speakers_found)} speakers in SRT, assigning voices...")
+            # Re-run gender detection from original audio if available
+            audio_raw = self.cfg.work_dir / "audio_raw.wav"
+            if audio_raw.exists():
+                speaker_ranges = {}
+                for seg in translated:
+                    spk = seg.get("speaker_id")
+                    if spk:
+                        if spk not in speaker_ranges:
+                            speaker_ranges[spk] = []
+                        speaker_ranges[spk].append((seg["start"], seg["end"]))
+                speaker_genders = self._detect_speaker_genders(audio_raw, speaker_ranges)
+                self._voice_map = self._assign_voices_to_speakers(speaker_genders)
+                self._report("translate", 0.8,
+                             f"Assigned voices: {', '.join(f'{k}={v}' for k, v in self._voice_map.items())}")
+            else:
+                # No audio for gender detection — alternate male/female
+                self._voice_map = {}
+                lang = self.cfg.target_language
+                pool = VOICE_POOL.get(lang, {})
+                female_voices = list(pool.get("female", [DEFAULT_VOICES.get(lang, "en-US-JennyNeural")]))
+                male_voices = list(pool.get("male", [MALE_VOICES.get(lang, "en-US-GuyNeural")]))
+                for i, spk in enumerate(sorted(speakers_found)):
+                    if i % 2 == 0:
+                        self._voice_map[spk] = female_voices[i // 2 % len(female_voices)]
+                    else:
+                        self._voice_map[spk] = male_voices[i // 2 % len(male_voices)]
+        else:
+            self._voice_map = None
+
         self._report("translate", 1.0, f"Loaded {len(translated)} translated segments")
 
         # Find existing video and audio from first run
@@ -2194,10 +2231,25 @@ class Pipeline:
         import torchaudio
         # Accept Coqui TOS automatically (non-interactive server environment)
         os.environ["COQUI_TOS_AGREED"] = "1"
+        # Fix Windows encoding: Coqui TTS prints non-ASCII text to stdout/stderr
+        os.environ["PYTHONIOENCODING"] = "utf-8"
+        import sys, io
+        if hasattr(sys.stdout, 'buffer'):
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        if hasattr(sys.stderr, 'buffer'):
+            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+        # PyTorch 2.6+ defaults weights_only=True which breaks Coqui's model loading
+        _original_torch_load = torch.load
+        torch.load = lambda *args, **kwargs: _original_torch_load(
+            *args, **{**kwargs, "weights_only": False}
+        )
         from TTS.api import TTS
 
         self._report("synthesize", 0.02, "Loading XTTS v2 model on GPU (this may take a minute)...")
-        tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cuda")
+        try:
+            tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cuda")
+        finally:
+            torch.load = _original_torch_load  # Restore original
 
         # Use original audio as speaker reference for voice cloning
         ref_wav = self.cfg.work_dir / "voice_ref.wav"

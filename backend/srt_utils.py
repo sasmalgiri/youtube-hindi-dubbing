@@ -13,7 +13,10 @@ def _parse_time(ts: str) -> float:
 
 
 def parse_srt(srt_path: Path, text_key: str = "text_translated") -> List[Dict]:
-    """Parse an SRT file into segments: [{"start": float, "end": float, text_key: str}, ...]"""
+    """Parse an SRT file into segments.
+    Extracts [SPEAKER_XX] labels if present in the text.
+    Returns: [{"start": float, "end": float, text_key: str, "speaker_id": str (optional)}, ...]
+    """
     content = srt_path.read_text(encoding="utf-8")
     segments = []
     # Split on blank lines to get blocks
@@ -31,9 +34,15 @@ def parse_srt(srt_path: Path, text_key: str = "text_translated") -> List[Dict]:
         text = " ".join(lines[2:]).strip()
         if text:
             seg = {"start": start, "end": end, text_key: text}
+            # Extract [SPEAKER_XX] label if present
+            speaker_match = re.match(r"\[(SPEAKER_\d+)\]\s*(.+)", text)
+            if speaker_match:
+                seg["speaker_id"] = speaker_match.group(1)
+                clean_text = speaker_match.group(2).strip()
+                seg[text_key] = clean_text
             # Also set "text" key so downstream code that accesses seg["text"] works
             if text_key != "text":
-                seg["text"] = text
+                seg["text"] = seg[text_key]
             segments.append(seg)
     return segments
 
@@ -48,13 +57,17 @@ def _fmt_time(t: float) -> str:
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
 
-def write_srt(segments: List[Dict], out_path: Path, text_key: str = "text"):
+def write_srt(segments: List[Dict], out_path: Path, text_key: str = "text",
+              include_speaker: bool = False):
     lines = []
     for i, seg in enumerate(sorted(segments, key=lambda s: s["start"]), start=1):
         start = _fmt_time(seg["start"])
         end = _fmt_time(seg["end"])
         text = seg.get(text_key, "").strip()
         if text:
+            # Optionally prepend speaker label so translator can preserve it
+            if include_speaker and "speaker_id" in seg:
+                text = f"[{seg['speaker_id']}] {text}"
             lines.append(f"{i}\n{start} --> {end}\n{text}\n")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines), encoding="utf-8")
