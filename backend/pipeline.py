@@ -2783,14 +2783,19 @@ class Pipeline:
         edge_results = {}
         errors = []
 
+        # Separate work dirs to prevent filename collisions
+        coqui_dir = self.cfg.work_dir / "hybrid_coqui"
+        edge_dir = self.cfg.work_dir / "hybrid_edge"
+        coqui_dir.mkdir(exist_ok=True)
+        edge_dir.mkdir(exist_ok=True)
+
         self._report("synthesize", 0.05,
                      f"Hybrid: {len(coqui_segments)} segs → Coqui GPU, {len(edge_segments)} segs → Edge-TTS cloud")
 
         def run_coqui():
             try:
-                # Create a sub-list of just the coqui segments
                 coqui_segs_only = [seg for _, seg in coqui_segments]
-                results = self._tts_coqui_xtts(coqui_segs_only)
+                results = self._tts_coqui_xtts(coqui_segs_only, work_dir=coqui_dir)
                 for result, (orig_idx, _) in zip(results, coqui_segments):
                     coqui_results[orig_idx] = result
             except Exception as e:
@@ -2799,7 +2804,7 @@ class Pipeline:
         def run_edge():
             try:
                 edge_segs_only = [seg for _, seg in edge_segments]
-                results = self._tts_edge(edge_segs_only, voice_map=self._voice_map)
+                results = self._tts_edge(edge_segs_only, voice_map=self._voice_map, work_dir=edge_dir)
                 for result, (orig_idx, _) in zip(results, edge_segments):
                     edge_results[orig_idx] = result
             except Exception as e:
@@ -2826,7 +2831,7 @@ class Pipeline:
             self._report("synthesize", 0.85,
                          "Coqui failed — re-generating its segments via Edge-TTS...")
             coqui_segs_only = [seg for _, seg in coqui_segments]
-            fallback_results = self._tts_edge(coqui_segs_only, voice_map=self._voice_map)
+            fallback_results = self._tts_edge(coqui_segs_only, voice_map=self._voice_map, work_dir=coqui_dir)
             for result, (orig_idx, _) in zip(fallback_results, coqui_segments):
                 all_results[orig_idx] = result
 
@@ -3070,12 +3075,14 @@ class Pipeline:
 
         return tts_data
 
-    def _tts_coqui_xtts(self, segments):
+    def _tts_coqui_xtts(self, segments, work_dir=None):
         """Generate TTS using Coqui XTTS v2 — open-source voice cloning.
 
         Can clone the original speaker's voice and speak in Hindi/Bengali/etc.
         Requires GPU. Uses the extracted audio as voice reference.
         """
+        if work_dir is None:
+            work_dir = self.cfg.work_dir
         import torch
         import torchaudio
         # Accept Coqui TOS automatically (non-interactive server environment)
@@ -3104,58 +3111,56 @@ class Pipeline:
         finally:
             torch.load = _original_torch_load  # Restore original
 
-        # Build per-speaker reference map if available
-        refs_dir = self.cfg.work_dir / "speaker_refs"
-        speaker_ref_map: Dict[str, Path] = {}
-        if refs_dir.exists():
-            for ref_file in refs_dir.glob("SPEAKER_*.wav"):
-                spk_id = ref_file.stem  # e.g. "SPEAKER_00"
-                speaker_ref_map[spk_id] = ref_file
-            if speaker_ref_map:
-                self._report("synthesize", 0.04,
-                             f"Found {len(speaker_ref_map)} per-speaker voice references for cloning")
-
-        # Default reference: single voice from original audio
-        ref_wav = self.cfg.work_dir / "voice_ref.wav"
-        audio_raw = self.cfg.work_dir / "audio_raw.wav"
-        if not ref_wav.exists() and audio_raw.exists():
-            # Extract a 15-second clip from the original audio for voice reference
-            subprocess.run(
-                [self._ffmpeg, "-y", "-i", str(audio_raw),
-                 "-t", "15", "-ar", "22050", "-ac", "1",
-                 str(ref_wav)],
-                check=True, capture_output=True,
-            )
-
-        # Check if we also have a user-provided reference in voices/
-        user_ref = Path("voices/my_voice_refs")
-        if user_ref.exists():
-            ref_files = list(user_ref.glob("*.wav")) + list(user_ref.glob("*.mp3"))
-            if ref_files:
-                ref_wav = ref_files[0]
-                self._report("synthesize", 0.05, f"Using custom voice reference: {ref_wav.name}")
-
-        if not ref_wav.exists() and not speaker_ref_map:
-            raise RuntimeError("No voice reference available for XTTS voice cloning")
-
-        # Map language codes for XTTS
-        XTTS_LANG_MAP = {
-            "hi": "hi", "bn": "bn", "ta": "ta", "te": "te",
-            "en": "en", "es": "es", "fr": "fr", "de": "de",
-            "it": "it", "pt": "pt", "pl": "pl", "tr": "tr",
-            "ru": "ru", "nl": "nl", "cs": "cs", "ar": "ar",
-            "zh": "zh-cn", "ja": "ja", "ko": "ko", "hu": "hu",
-        }
-        xtts_lang = XTTS_LANG_MAP.get(self.cfg.target_language, self.cfg.target_language)
-
         tts_data = []
         try:
+            # Build per-speaker reference map if available
+            refs_dir = self.cfg.work_dir / "speaker_refs"
+            speaker_ref_map: Dict[str, Path] = {}
+            if refs_dir.exists():
+                for ref_file in refs_dir.glob("SPEAKER_*.wav"):
+                    spk_id = ref_file.stem  # e.g. "SPEAKER_00"
+                    speaker_ref_map[spk_id] = ref_file
+                if speaker_ref_map:
+                    self._report("synthesize", 0.04,
+                                 f"Found {len(speaker_ref_map)} per-speaker voice references for cloning")
+
+            # Default reference: single voice from original audio
+            ref_wav = self.cfg.work_dir / "voice_ref.wav"
+            audio_raw = self.cfg.work_dir / "audio_raw.wav"
+            if not ref_wav.exists() and audio_raw.exists():
+                subprocess.run(
+                    [self._ffmpeg, "-y", "-i", str(audio_raw),
+                     "-t", "15", "-ar", "22050", "-ac", "1",
+                     str(ref_wav)],
+                    check=True, capture_output=True,
+                )
+
+            # Check if we also have a user-provided reference in voices/
+            user_ref = Path(__file__).resolve().parent / "voices" / "my_voice_refs"
+            if user_ref.exists():
+                ref_files = list(user_ref.glob("*.wav")) + list(user_ref.glob("*.mp3"))
+                if ref_files:
+                    ref_wav = ref_files[0]
+                    self._report("synthesize", 0.05, f"Using custom voice reference: {ref_wav.name}")
+
+            if not ref_wav.exists() and not speaker_ref_map:
+                raise RuntimeError("No voice reference available for XTTS voice cloning")
+
+            # Map language codes for XTTS
+            XTTS_LANG_MAP = {
+                "hi": "hi", "bn": "bn", "ta": "ta", "te": "te",
+                "en": "en", "es": "es", "fr": "fr", "de": "de",
+                "it": "it", "pt": "pt", "pl": "pl", "tr": "tr",
+                "ru": "ru", "nl": "nl", "cs": "cs", "ar": "ar",
+                "zh": "zh-cn", "ja": "ja", "ko": "ko", "hu": "hu",
+            }
+            xtts_lang = XTTS_LANG_MAP.get(self.cfg.target_language, self.cfg.target_language)
             for i, seg in enumerate(segments):
                 text = seg.get("text_translated", seg.get("text", "")).strip()
                 if not text:
                     continue
 
-                wav_path = self.cfg.work_dir / f"tts_{i:04d}.wav"
+                wav_path = work_dir / f"tts_{i:04d}.wav"
 
                 # Pick per-speaker reference if available, else default
                 spk_id = seg.get("speaker_id", "")
@@ -3170,7 +3175,7 @@ class Pipeline:
                     )
 
                     # Convert to target sample rate and stereo
-                    wav_fixed = self.cfg.work_dir / f"tts_{i:04d}_fixed.wav"
+                    wav_fixed = work_dir / f"tts_{i:04d}_fixed.wav"
                     subprocess.run(
                         [self._ffmpeg, "-y", "-i", str(wav_path),
                          "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
@@ -3203,6 +3208,17 @@ class Pipeline:
         finally:
             del tts_model
             torch.cuda.empty_cache()
+            # Detach wrappers before restoring to prevent GC from closing shared buffer
+            if sys.stdout is not _orig_stdout:
+                try:
+                    sys.stdout.detach()
+                except Exception:
+                    pass
+            if sys.stderr is not _orig_stderr:
+                try:
+                    sys.stderr.detach()
+                except Exception:
+                    pass
             sys.stdout, sys.stderr = _orig_stdout, _orig_stderr
 
         return tts_data
@@ -3213,11 +3229,13 @@ class Pipeline:
         comm = edge_tts.Communicate(text, self.cfg.tts_voice, rate=self.cfg.tts_rate)
         await comm.save(str(mp3_path))
 
-    def _tts_edge(self, segments, voice_map=None):
+    def _tts_edge(self, segments, voice_map=None, work_dir=None):
         """Generate TTS using edge-tts (free Microsoft voices).
         If voice_map is provided, each segment uses its speaker's assigned voice.
         Uses parallel processing for speed — 20 segments at once.
         """
+        if work_dir is None:
+            work_dir = self.cfg.work_dir
         import edge_tts
         default_voice = self.cfg.tts_voice
         rate = self.cfg.tts_rate
@@ -3230,7 +3248,7 @@ class Pipeline:
             seg_voice = default_voice
             if voice_map and "speaker_id" in seg:
                 seg_voice = voice_map.get(seg["speaker_id"], default_voice)
-            mp3 = self.cfg.work_dir / f"tts_{i:04d}.mp3"
+            mp3 = work_dir / f"tts_{i:04d}.mp3"
             async with semaphore:
                 try:
                     comm = edge_tts.Communicate(text, seg_voice, rate=rate)
@@ -3268,7 +3286,7 @@ class Pipeline:
             mp3 = seg.pop("_tts_mp3", None)
             if not mp3 or not mp3.exists():
                 return None
-            wav = self.cfg.work_dir / f"tts_{i:04d}.wav"
+            wav = work_dir / f"tts_{i:04d}.wav"
             # Single ffmpeg: MP3→WAV + resample + 1.25x speed in one pass
             subprocess.run(
                 [self._ffmpeg, "-y", "-i", str(mp3),

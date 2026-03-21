@@ -346,8 +346,6 @@ def _run_job(job: Job, req: JobCreateRequest):
             raise RuntimeError("Pipeline finished but output file not found")
 
         job.result_path = out_path
-        job.video_title = pipeline.video_title or "Untitled"
-        job.segments = pipeline.segments
 
         # Auto-save to titled folder
         try:
@@ -372,9 +370,12 @@ def _run_job(job: Job, req: JobCreateRequest):
 
     except Exception as e:
         import traceback
-        (OUTPUTS / job.id / "error.log").write_text(
-            f"[JOB ERROR] {e}\n{traceback.format_exc()}", encoding="utf-8"
-        )
+        try:
+            (OUTPUTS / job.id / "error.log").write_text(
+                f"[JOB ERROR] {e}\n{traceback.format_exc()}", encoding="utf-8"
+            )
+        except OSError:
+            pass
         job.state = "error"
         job.error = str(e)
         job.message = f"Error: {e}"
@@ -680,6 +681,7 @@ def _run_resume(job: Job):
             audio_priority=req.audio_priority if req else True,
             audio_bitrate=req.audio_bitrate if req else "192k",
             encode_preset=req.encode_preset if req else "veryfast",
+            multi_speaker=req.multi_speaker if req else False,
         )
 
         pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job))
@@ -714,9 +716,12 @@ def _run_resume(job: Job):
 
     except Exception as e:
         import traceback
-        (OUTPUTS / job.id / "error.log").write_text(
-            f"[RESUME ERROR] {e}\n{traceback.format_exc()}", encoding="utf-8"
-        )
+        try:
+            (OUTPUTS / job.id / "error.log").write_text(
+                f"[RESUME ERROR] {e}\n{traceback.format_exc()}", encoding="utf-8"
+            )
+        except OSError:
+            pass
         job.state = "error"
         job.error = str(e)
         job.message = f"Error: {e}"

@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
     createJob,
+    getJob,
     localDownloadAndDub,
     isRemoteBackend,
     subscribeToJobEvents,
@@ -126,12 +127,23 @@ export function useBatchManager(): UseBatchManagerReturn {
                     if (event.message) updates.message = event.message;
                     if (event.overall !== undefined) updates.progress = event.overall * 100;
 
-                    if (event.type === 'complete' || event.state === 'done') {
+                    if (event.state === 'waiting_for_srt') {
+                        updates.step = 'Awaiting SRT';
+                        updates.message = 'Transcription complete. Open job page to upload SRT.';
+                        unsubscribesRef.current.get(jobId)?.();
+                        unsubscribesRef.current.delete(jobId);
+                    } else if (event.type === 'complete' || event.state === 'done') {
                         updates.state = 'done';
                         updates.progress = 100;
                         // Unsubscribe
                         unsubscribesRef.current.get(jobId)?.();
                         unsubscribesRef.current.delete(jobId);
+                        // Fetch video title for proper download filename
+                        getJob(jobId).then((job) => {
+                            if (job.video_title) {
+                                updateItem(index, { videoTitle: job.video_title });
+                            }
+                        }).catch(() => {});
                     }
 
                     if (event.state === 'error' || event.type === 'error') {

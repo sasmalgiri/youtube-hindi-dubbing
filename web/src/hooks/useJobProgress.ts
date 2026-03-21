@@ -150,7 +150,7 @@ export function useJobProgress(jobId: string | null): JobProgress {
         unsubRef.current = unsub;
 
         return () => {
-            unsub();
+            if (unsubRef.current) unsubRef.current();
             if (pollRef.current) clearInterval(pollRef.current);
         };
     }, [jobId, startPolling]);
