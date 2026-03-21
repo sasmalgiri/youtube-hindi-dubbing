@@ -19,8 +19,6 @@ export interface DubbingSettings {
     audio_priority: boolean;
     audio_bitrate: string;
     encode_preset: string;
-    remove_watermark: boolean;
-    use_groq_whisper: boolean;
 }
 
 interface SettingsPanelProps {
@@ -58,125 +56,103 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
 
             {open && (
                 <div className="px-5 pb-5 space-y-5 animate-slide-up border-t border-border pt-4">
-                    {/* Transcription (Whisper) */}
+                    {/* ── Transcription Section ── */}
                     <div>
                         <p className="text-sm font-medium text-text-primary mb-3">Transcription (Whisper)</p>
-                        <div className="grid grid-cols-3 gap-2">
-                            {([['base', 'Base', 'Fast, lower accuracy'], ['medium', 'Medium', 'Balanced'], ['large-v3', 'Large-v3', 'Best accuracy, slowest']] as const).map(([key, label, desc]) => (
+                        <div className="space-y-3">
+                            <div>
+                                <p className="text-xs text-text-muted mb-1.5">Whisper Model</p>
+                                <div className="grid grid-cols-3 gap-2">
+                                    {[
+                                        { value: 'base', label: 'Base', desc: 'Fast, basic' },
+                                        { value: 'medium', label: 'Medium', desc: 'Balanced' },
+                                        { value: 'large-v3', label: 'Large-v3', desc: 'Best quality' },
+                                    ].map((m) => (
+                                        <button
+                                            key={m.value}
+                                            onClick={() => update({ asr_model: m.value })}
+                                            className={`
+                                                px-3 py-2 rounded-lg text-xs text-center transition-all border
+                                                ${settings.asr_model === m.value
+                                                    ? 'bg-primary/20 border-primary text-primary-light'
+                                                    : 'bg-white/5 border-white/10 text-text-muted hover:bg-white/10'}
+                                            `}
+                                        >
+                                            <div className="font-medium">{m.label}</div>
+                                            <div className="text-[10px] opacity-70 mt-0.5">{m.desc}</div>
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+
+                            {/* YouTube Subtitles */}
+                            <div className="flex items-center justify-between">
+                                <div>
+                                    <p className="text-sm text-text-primary">Use YouTube Subtitles</p>
+                                    <p className="text-xs text-text-muted">Skip Whisper, use existing subs (faster)</p>
+                                </div>
                                 <button
-                                    key={key}
-                                    onClick={() => update({ asr_model: key })}
-                                    className={`px-3 py-2.5 rounded-lg border text-left transition-all ${settings.asr_model === key ? 'border-primary bg-primary/10 text-primary-light' : 'border-border bg-white/[0.02] text-text-secondary hover:border-text-muted'}`}
+                                    onClick={() => update({ prefer_youtube_subs: !settings.prefer_youtube_subs })}
+                                    className={`
+                                        w-11 h-6 rounded-full transition-colors relative
+                                        ${settings.prefer_youtube_subs ? 'bg-primary' : 'bg-white/10'}
+                                    `}
                                 >
-                                    <p className="text-sm font-medium">{label}</p>
-                                    <p className="text-[10px] text-text-muted">{desc}</p>
+                                    <div className={`
+                                        w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                        ${settings.prefer_youtube_subs ? 'translate-x-6' : 'translate-x-1'}
+                                    `} />
                                 </button>
-                            ))}
+                            </div>
                         </div>
                     </div>
 
-                    {/* Translation Engine */}
+                    {/* ── Translation Section ── */}
                     <div>
                         <p className="text-sm font-medium text-text-primary mb-3">Translation Engine</p>
-                        <div className="grid grid-cols-3 gap-2">
-                            {([['auto', 'Auto'], ['gemini', 'Gemini'], ['groq', 'Groq'], ['ollama', 'Ollama'], ['hinglish', 'Hinglish AI'], ['google', 'Google']] as const).map(([key, label]) => (
+                        <div className="grid grid-cols-4 gap-2 mb-3">
+                            {[
+                                { value: 'auto', label: 'Auto', desc: 'Best available' },
+                                { value: 'turbo', label: 'Turbo', desc: 'Groq+Cerebras parallel' },
+                                { value: 'groq', label: 'Groq', desc: 'Llama 3.3 70B (free)' },
+                                { value: 'cerebras', label: 'Cerebras', desc: 'Llama 3.3 70B (free)' },
+                            ].map((m) => (
                                 <button
-                                    key={key}
-                                    onClick={() => update({ translation_engine: key })}
-                                    className={`px-3 py-2 rounded-lg border text-sm transition-all ${settings.translation_engine === key ? 'border-primary bg-primary/10 text-primary-light font-medium' : 'border-border bg-white/[0.02] text-text-secondary hover:border-text-muted'}`}
+                                    key={m.value}
+                                    onClick={() => update({ translation_engine: m.value })}
+                                    className={`
+                                        px-3 py-2 rounded-lg text-xs text-center transition-all border
+                                        ${settings.translation_engine === m.value
+                                            ? 'bg-primary/20 border-primary text-primary-light'
+                                            : 'bg-white/5 border-white/10 text-text-muted hover:bg-white/10'}
+                                    `}
                                 >
-                                    {label}
+                                    <div className="font-medium">{m.label}</div>
+                                    <div className="text-[10px] opacity-70 mt-0.5">{m.desc}</div>
                                 </button>
                             ))}
                         </div>
-                    </div>
-
-                    {/* Audio & Performance */}
-                    <div className="space-y-3">
-                        <p className="text-sm font-medium text-text-primary">Audio & Performance</p>
-                        {/* Audio Priority */}
-                        <div className="flex items-center justify-between">
-                            <div>
-                                <p className="text-sm text-text-primary">Audio Priority</p>
-                                <p className="text-xs text-text-muted">TTS speaks naturally, video adjusts (faster assembly)</p>
-                            </div>
-                            <button
-                                onClick={() => update({ audio_priority: !settings.audio_priority })}
-                                className={`w-11 h-6 rounded-full transition-colors relative ${settings.audio_priority ? 'bg-primary' : 'bg-white/10'}`}
-                            >
-                                <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${settings.audio_priority ? 'translate-x-6' : 'translate-x-1'}`} />
-                            </button>
+                        <div className="grid grid-cols-3 gap-2">
+                            {[
+                                { value: 'ollama', label: 'Ollama', desc: 'Local LLM (GPU)' },
+                                { value: 'hinglish', label: 'Hinglish AI', desc: 'Custom Hindi model' },
+                                { value: 'google', label: 'Google', desc: 'Free, basic' },
+                            ].map((m) => (
+                                <button
+                                    key={m.value}
+                                    onClick={() => update({ translation_engine: m.value })}
+                                    className={`
+                                        px-3 py-2 rounded-lg text-xs text-center transition-all border
+                                        ${settings.translation_engine === m.value
+                                            ? 'bg-primary/20 border-primary text-primary-light'
+                                            : 'bg-white/5 border-white/10 text-text-muted hover:bg-white/10'}
+                                    `}
+                                >
+                                    <div className="font-medium">{m.label}</div>
+                                    <div className="text-[10px] opacity-70 mt-0.5">{m.desc}</div>
+                                </button>
+                            ))}
                         </div>
-                        {/* Audio Quality */}
-                        <div>
-                            <p className="text-xs text-text-secondary mb-1.5">Audio Quality</p>
-                            <div className="grid grid-cols-4 gap-1.5">
-                                {(['128k', '192k', '256k', '320k'] as const).map(br => (
-                                    <button
-                                        key={br}
-                                        onClick={() => update({ audio_bitrate: br })}
-                                        className={`px-2 py-1.5 rounded text-xs transition-all ${settings.audio_bitrate === br ? 'bg-primary/20 text-primary-light border border-primary/40' : 'bg-white/[0.03] text-text-muted border border-border hover:border-text-muted'}`}
-                                    >
-                                        {br}
-                                    </button>
-                                ))}
-                            </div>
-                        </div>
-                        {/* Encode Speed */}
-                        <div>
-                            <p className="text-xs text-text-secondary mb-1.5">Video Encode Speed</p>
-                            <div className="grid grid-cols-4 gap-1.5">
-                                {(['ultrafast', 'veryfast', 'fast', 'medium'] as const).map(p => (
-                                    <button
-                                        key={p}
-                                        onClick={() => update({ encode_preset: p })}
-                                        className={`px-2 py-1.5 rounded text-xs transition-all ${settings.encode_preset === p ? 'bg-primary/20 text-primary-light border border-primary/40' : 'bg-white/[0.03] text-text-muted border border-border hover:border-text-muted'}`}
-                                    >
-                                        {p}
-                                    </button>
-                                ))}
-                            </div>
-                        </div>
-                    </div>
-
-                    {/* YouTube Subtitles */}
-                    <div className="flex items-center justify-between">
-                        <div>
-                            <p className="text-sm text-text-primary">Use YouTube Subtitles</p>
-                            <p className="text-xs text-text-muted">Skip Whisper, use existing subs (faster, no GPU for transcription)</p>
-                        </div>
-                        <button
-                            onClick={() => update({ prefer_youtube_subs: !settings.prefer_youtube_subs })}
-                            className={`
-                                w-11 h-6 rounded-full transition-colors relative
-                                ${settings.prefer_youtube_subs ? 'bg-primary' : 'bg-white/10'}
-                            `}
-                        >
-                            <div className={`
-                                w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
-                                ${settings.prefer_youtube_subs ? 'translate-x-6' : 'translate-x-1'}
-                            `} />
-                        </button>
-                    </div>
-
-                    {/* Groq Whisper API */}
-                    <div className="flex items-center justify-between">
-                        <div>
-                            <p className="text-sm text-text-primary">Groq Whisper API</p>
-                            <p className="text-xs text-text-muted">Cloud transcription — much faster than local Whisper (needs GROQ_API_KEY)</p>
-                        </div>
-                        <button
-                            onClick={() => update({ use_groq_whisper: !settings.use_groq_whisper })}
-                            className={`
-                                w-11 h-6 rounded-full transition-colors relative
-                                ${settings.use_groq_whisper ? 'bg-primary' : 'bg-white/10'}
-                            `}
-                        >
-                            <div className={`
-                                w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
-                                ${settings.use_groq_whisper ? 'translate-x-6' : 'translate-x-1'}
-                            `} />
-                        </button>
                     </div>
 
                     {/* Transcribe Only (manual translation) */}
@@ -215,26 +191,6 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                             <div className={`
                                 w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
                                 ${settings.multi_speaker ? 'translate-x-6' : 'translate-x-1'}
-                            `} />
-                        </button>
-                    </div>
-
-                    {/* Remove Watermark */}
-                    <div className="flex items-center justify-between">
-                        <div>
-                            <p className="text-sm text-text-primary">Remove Watermark</p>
-                            <p className="text-xs text-text-muted">Detect & remove static logos/overlays from video (adds processing time)</p>
-                        </div>
-                        <button
-                            onClick={() => update({ remove_watermark: !settings.remove_watermark })}
-                            className={`
-                                w-11 h-6 rounded-full transition-colors relative
-                                ${settings.remove_watermark ? 'bg-primary' : 'bg-white/10'}
-                            `}
-                        >
-                            <div className={`
-                                w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
-                                ${settings.remove_watermark ? 'translate-x-6' : 'translate-x-1'}
                             `} />
                         </button>
                     </div>
@@ -402,9 +358,94 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                                 value={settings.original_volume * 100}
                                 onChange={(e) => update({ original_volume: parseInt(e.target.value) / 100 })}
                                 className="w-full accent-primary"
+                                title="Original volume"
                             />
                         </div>
                     )}
+
+                    {/* ── Audio & Performance Section ── */}
+                    <div>
+                        <p className="text-sm font-medium text-text-primary mb-3">Audio & Performance</p>
+                        <div className="space-y-3">
+                            {/* Audio Priority */}
+                            <div className="flex items-center justify-between">
+                                <div>
+                                    <p className="text-sm text-text-primary">Audio Priority</p>
+                                    <p className="text-xs text-text-muted">TTS speaks naturally, video adjusts to match (best for listening)</p>
+                                </div>
+                                <button
+                                    type="button"
+                                    title="Toggle audio priority"
+                                    onClick={() => update({ audio_priority: !settings.audio_priority })}
+                                    className={`
+                                        w-11 h-6 rounded-full transition-colors relative
+                                        ${settings.audio_priority ? 'bg-primary' : 'bg-white/10'}
+                                    `}
+                                >
+                                    <div className={`
+                                        w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                        ${settings.audio_priority ? 'translate-x-6' : 'translate-x-1'}
+                                    `} />
+                                </button>
+                            </div>
+
+                            {/* Audio Bitrate */}
+                            <div>
+                                <p className="text-xs text-text-muted mb-1.5">Audio Quality</p>
+                                <div className="grid grid-cols-4 gap-2">
+                                    {[
+                                        { value: '128k', label: '128k', desc: 'Small file' },
+                                        { value: '192k', label: '192k', desc: 'Standard' },
+                                        { value: '256k', label: '256k', desc: 'High' },
+                                        { value: '320k', label: '320k', desc: 'Best' },
+                                    ].map((m) => (
+                                        <button
+                                            type="button"
+                                            key={m.value}
+                                            onClick={() => update({ audio_bitrate: m.value })}
+                                            className={`
+                                                px-2 py-2 rounded-lg text-xs text-center transition-all border
+                                                ${settings.audio_bitrate === m.value
+                                                    ? 'bg-primary/20 border-primary text-primary-light'
+                                                    : 'bg-white/5 border-white/10 text-text-muted hover:bg-white/10'}
+                                            `}
+                                        >
+                                            <div className="font-medium">{m.label}</div>
+                                            <div className="text-[10px] opacity-70 mt-0.5">{m.desc}</div>
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+
+                            {/* Encode Speed */}
+                            <div>
+                                <p className="text-xs text-text-muted mb-1.5">Video Encode Speed</p>
+                                <div className="grid grid-cols-4 gap-2">
+                                    {[
+                                        { value: 'ultrafast', label: 'Ultra Fast', desc: 'Fastest' },
+                                        { value: 'veryfast', label: 'Very Fast', desc: 'Default' },
+                                        { value: 'fast', label: 'Fast', desc: 'Better' },
+                                        { value: 'medium', label: 'Medium', desc: 'Best video' },
+                                    ].map((m) => (
+                                        <button
+                                            type="button"
+                                            key={m.value}
+                                            onClick={() => update({ encode_preset: m.value })}
+                                            className={`
+                                                px-2 py-2 rounded-lg text-xs text-center transition-all border
+                                                ${settings.encode_preset === m.value
+                                                    ? 'bg-primary/20 border-primary text-primary-light'
+                                                    : 'bg-white/5 border-white/10 text-text-muted hover:bg-white/10'}
+                                            `}
+                                        >
+                                            <div className="font-medium">{m.label}</div>
+                                            <div className="text-[10px] opacity-70 mt-0.5">{m.desc}</div>
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             )}
         </div>

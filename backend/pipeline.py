@@ -1544,17 +1544,29 @@ class Pipeline:
         """Translate each segment individually, preserving timestamps for sync.
 
         Respects self.cfg.translation_engine setting.
-        Auto priority: OpenAI GPT-4o > Groq Llama 3.3 > Gemini > Ollama > Google Translate
+        Auto priority: OpenAI GPT-4o > Groq Llama 3.3 > Cerebras > Gemini > Ollama > Google Translate
         """
         openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
         groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+        cerebras_key = os.environ.get("CEREBRAS_API_KEY", "").strip()
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
         engine = self.cfg.translation_engine
 
         # Specific engine selected
-        if engine == "hinglish" and self._ollama_available():
+        if engine == "turbo" and groq_key and cerebras_key:
+            self._report("translate", 0.05, "TURBO: Groq + Cerebras parallel translation...")
+            self._translate_segments_turbo(segments, groq_key, cerebras_key)
+            return
+        elif engine == "turbo":
+            # Turbo selected but missing a key — fall through to best single engine
+            self._report("translate", 0.05, "Turbo needs both Groq + Cerebras keys, using best available...")
+        elif engine == "hinglish" and self._ollama_available():
             self._report("translate", 0.05, "Using Hinglish AI (custom Ollama model)...")
             self._translate_segments_ollama(segments, force_model="hinglish-translator")
+            return
+        elif engine == "cerebras" and cerebras_key:
+            self._report("translate", 0.05, "Using Cerebras (Llama 3.3 70B) for translation...")
+            self._translate_segments_cerebras(segments, cerebras_key)
             return
         elif engine == "groq" and groq_key:
             self._report("translate", 0.05, "Using Groq (Llama 3.3 70B) for translation...")
@@ -1573,13 +1585,19 @@ class Pipeline:
             self._translate_segments_google(segments)
             return
 
-        # Auto mode: best available
-        if openai_key:
+        # Auto mode: best available (turbo if both keys exist)
+        if groq_key and cerebras_key:
+            self._report("translate", 0.05, "TURBO: Groq + Cerebras parallel translation...")
+            self._translate_segments_turbo(segments, groq_key, cerebras_key)
+        elif openai_key:
             self._report("translate", 0.05, "Using GPT-4o for premium translation...")
             self._translate_segments_openai(segments, openai_key)
         elif groq_key:
             self._report("translate", 0.05, "Using Groq (Llama 3.3 70B) for translation...")
             self._translate_segments_groq(segments, groq_key)
+        elif cerebras_key:
+            self._report("translate", 0.05, "Using Cerebras (Llama 3.3 70B) for translation...")
+            self._translate_segments_cerebras(segments, cerebras_key)
         elif gemini_key:
             self._report("translate", 0.05, "Using Gemini for colloquial translation...")
             self._translate_segments_gemini(segments, gemini_key)
@@ -1686,6 +1704,162 @@ class Pipeline:
 
             self._report("translate", 0.1 + 0.9 * ((batch_idx + 1) / total_batches),
                          f"Translated batch {batch_idx + 1}/{total_batches} (Groq)")
+
+    def _translate_segments_cerebras(self, segments, api_key):
+        """Translate segments using Cerebras (Llama 3.3 70B) — extremely fast, free."""
+        import requests as _requests
+
+        batch_size = 50
+        total_batches = (len(segments) + batch_size - 1) // batch_size
+        system_msg = self._get_translation_prompt("system")
+
+        for batch_idx in range(total_batches):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, len(segments))
+            batch = segments[start:end]
+
+            lines = [f"{i+1}. {seg['text']}" for i, seg in enumerate(batch)]
+            user_msg = self._get_translation_prompt("user_prefix") + "\n".join(lines)
+
+            retries = 3
+            success = False
+            for attempt in range(retries):
+                try:
+                    resp = _requests.post(
+                        "https://api.cerebras.ai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json={
+                            "model": "llama-3.3-70b",
+                            "messages": [
+                                {"role": "system", "content": system_msg},
+                                {"role": "user", "content": user_msg},
+                            ],
+                            "temperature": 0.7,
+                            "max_tokens": 4096,
+                        },
+                        timeout=60,
+                    )
+                    resp.raise_for_status()
+                    result_text = resp.json()["choices"][0]["message"]["content"]
+                    translations = self._parse_numbered_translations(result_text, len(batch))
+                    for i, seg in enumerate(batch):
+                        seg["text_translated"] = translations[i] if translations[i] else seg["text"]
+                    success = True
+                    break
+                except Exception as e:
+                    if attempt < retries - 1:
+                        wait = 2 * (attempt + 1)
+                        self._report("translate", 0.1 + 0.8 * (batch_idx / total_batches),
+                                     f"Cerebras rate limited, retrying in {wait}s...")
+                        time.sleep(wait)
+
+            if not success:
+                self._report("translate", 0.1, "Cerebras failed, using Google Translate for batch...")
+                for seg in batch:
+                    seg["text_translated"] = self._translate_single_google(seg["text"])
+
+            self._report("translate", 0.1 + 0.9 * ((batch_idx + 1) / total_batches),
+                         f"Translated batch {batch_idx + 1}/{total_batches} (Cerebras)")
+
+    def _translate_segments_turbo(self, segments, groq_key, cerebras_key):
+        """TURBO: Split batches between Groq and Cerebras, translate in parallel.
+
+        Even-numbered batches → Groq, odd-numbered batches → Cerebras.
+        Both run simultaneously via threads = ~2x faster translation.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import requests as _requests
+        from groq import Groq
+
+        batch_size = 50
+        total_batches = (len(segments) + batch_size - 1) // batch_size
+        system_msg = self._get_translation_prompt("system")
+
+        groq_client = Groq(api_key=groq_key)
+
+        def translate_batch_groq(batch, batch_idx):
+            lines = [f"{i+1}. {seg['text']}" for i, seg in enumerate(batch)]
+            user_msg = self._get_translation_prompt("user_prefix") + "\n".join(lines)
+            for attempt in range(3):
+                try:
+                    response = groq_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[
+                            {"role": "system", "content": system_msg},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        temperature=0.7,
+                        max_tokens=4096,
+                    )
+                    return self._parse_numbered_translations(
+                        response.choices[0].message.content, len(batch))
+                except Exception:
+                    if attempt < 2:
+                        time.sleep(2 * (attempt + 1))
+            return None
+
+        def translate_batch_cerebras(batch, batch_idx):
+            lines = [f"{i+1}. {seg['text']}" for i, seg in enumerate(batch)]
+            user_msg = self._get_translation_prompt("user_prefix") + "\n".join(lines)
+            for attempt in range(3):
+                try:
+                    resp = _requests.post(
+                        "https://api.cerebras.ai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {cerebras_key}",
+                                 "Content-Type": "application/json"},
+                        json={
+                            "model": "llama-3.3-70b",
+                            "messages": [
+                                {"role": "system", "content": system_msg},
+                                {"role": "user", "content": user_msg},
+                            ],
+                            "temperature": 0.7,
+                            "max_tokens": 4096,
+                        },
+                        timeout=60,
+                    )
+                    resp.raise_for_status()
+                    return self._parse_numbered_translations(
+                        resp.json()["choices"][0]["message"]["content"], len(batch))
+                except Exception:
+                    if attempt < 2:
+                        time.sleep(2 * (attempt + 1))
+            return None
+
+        # Build batch list
+        batches = []
+        for batch_idx in range(total_batches):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, len(segments))
+            batches.append((batch_idx, segments[start:end]))
+
+        # Run even batches on Groq, odd on Cerebras — all in parallel
+        completed = 0
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {}
+            for batch_idx, batch in batches:
+                if batch_idx % 2 == 0:
+                    fut = pool.submit(translate_batch_groq, batch, batch_idx)
+                else:
+                    fut = pool.submit(translate_batch_cerebras, batch, batch_idx)
+                futures[fut] = (batch_idx, batch)
+
+            for fut in as_completed(futures):
+                batch_idx, batch = futures[fut]
+                translations = fut.result()
+                engine_name = "Groq" if batch_idx % 2 == 0 else "Cerebras"
+                if translations:
+                    for i, seg in enumerate(batch):
+                        seg["text_translated"] = translations[i] if translations[i] else seg["text"]
+                else:
+                    self._report("translate", 0.1,
+                                 f"{engine_name} failed batch {batch_idx+1}, falling back to Google...")
+                    for seg in batch:
+                        seg["text_translated"] = self._translate_single_google(seg["text"])
+
+                completed += 1
+                self._report("translate", 0.1 + 0.9 * (completed / total_batches),
+                             f"TURBO: {completed}/{total_batches} batches ({engine_name})")
 
     def _translate_segments_ollama(self, segments, force_model: str = ""):
         """Translate segments using local Ollama LLM in batches."""
