@@ -670,11 +670,11 @@ class Pipeline:
         if not tts_data:
             raise RuntimeError("TTS synthesis produced no audio segments — check TTS engine settings")
 
-        # Only speed up if TTS engine didn't already do it (Edge-TTS does it in MP3→WAV pass)
-        already_sped = any(t.get("_already_sped") for t in tts_data)
-        if not already_sped:
+        # Speed up segments that weren't already sped (Edge-TTS does it in MP3→WAV pass)
+        needs_speedup = [(i, t) for i, t in enumerate(tts_data) if not t.get("_already_sped")]
+        if needs_speedup:
             self._report("synthesize", 0.9,
-                         f"Speeding up {len(tts_data)} segments to 1.25x...")
+                         f"Speeding up {len(needs_speedup)} segments to 1.25x...")
             TTS_SPEED = 1.25
             from concurrent.futures import ThreadPoolExecutor
 
@@ -686,7 +686,7 @@ class Pipeline:
                 tts["duration"] = tts["duration"] / TTS_SPEED
 
             with ThreadPoolExecutor(max_workers=8) as pool:
-                list(pool.map(speedup_one, enumerate(tts_data)))
+                list(pool.map(speedup_one, needs_speedup))
 
         # Clean up internal flag
         for t in tts_data:
@@ -793,8 +793,8 @@ class Pipeline:
         if not tts_data:
             raise RuntimeError("TTS synthesis produced no audio segments — check TTS engine settings")
 
-        already_sped = any(t.get("_already_sped") for t in tts_data)
-        if not already_sped:
+        needs_speedup = [(i, t) for i, t in enumerate(tts_data) if not t.get("_already_sped")]
+        if needs_speedup:
             self._report("synthesize", 0.9, "Speeding up to 1.25x...")
             TTS_SPEED = 1.25
             from concurrent.futures import ThreadPoolExecutor
@@ -807,7 +807,7 @@ class Pipeline:
                 tts["duration"] = tts["duration"] / TTS_SPEED
 
             with ThreadPoolExecutor(max_workers=8) as pool:
-                list(pool.map(speedup_one, enumerate(tts_data)))
+                list(pool.map(speedup_one, needs_speedup))
 
         for t in tts_data:
             t.pop("_already_sped", None)
@@ -932,7 +932,7 @@ class Pipeline:
     def _extract_audio(self, video_path: Path) -> Path:
         """Extract audio from video. Creates both full-quality and lightweight versions.
         Full-quality (48kHz stereo) for final mix, lightweight (16kHz mono) for transcription."""
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         wav = self.cfg.work_dir / "audio_raw.wav"
         wav_16k = self.cfg.work_dir / "audio_16k.wav"
@@ -944,6 +944,7 @@ class Pipeline:
                  "-acodec", "pcm_s16le", str(wav)],
                 check=True, capture_output=True,
             )
+            return "full"
 
         def extract_16k():
             subprocess.run(
@@ -952,13 +953,23 @@ class Pipeline:
                  "-acodec", "pcm_s16le", str(wav_16k)],
                 check=True, capture_output=True,
             )
+            return "16k"
 
         # Extract both in parallel — saves ~50% extraction time
         with ThreadPoolExecutor(max_workers=2) as pool:
-            pool.submit(extract_full)
-            pool.submit(extract_16k)
+            fut_full = pool.submit(extract_full)
+            fut_16k = pool.submit(extract_16k)
 
-        self._whisper_audio = wav_16k  # Lightweight file for transcription
+            # Full-quality extraction is mandatory
+            fut_full.result()
+
+            # 16kHz is optional (for Groq API) — fall back to full if it fails
+            try:
+                fut_16k.result()
+                self._whisper_audio = wav_16k
+            except Exception:
+                self._whisper_audio = wav  # Fall back to full-quality for transcription
+
         return wav
 
     # ── Step 3a: Fetch YouTube subtitles (skip Whisper if available) ─────
@@ -2669,6 +2680,9 @@ class Pipeline:
     def _generate_tts_natural(self, segments):
         """Generate TTS at natural speed. Uses first enabled engine in priority order.
 
+        Hybrid mode: If both Coqui XTTS + Edge-TTS are enabled, splits segments
+        between GPU (Coqui) and cloud (Edge-TTS) in parallel for ~2x speed.
+
         Chatterbox is English-only — for other languages it auto-falls back to
         ElevenLabs (multilingual) or Edge-TTS (which has native voices for 70+ languages).
         """
@@ -2697,6 +2711,20 @@ class Pipeline:
                 return self._tts_elevenlabs(segments, elevenlabs_key)
             if not self.cfg.use_chatterbox:
                 raise RuntimeError("ElevenLabs enabled but ELEVENLABS_API_KEY not set in .env")
+
+        # HYBRID MODE: Coqui XTTS (GPU) + Edge-TTS (cloud) in parallel
+        if self.cfg.use_coqui_xtts and self.cfg.use_edge_tts:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    self._report("synthesize", 0.05,
+                                 "HYBRID: Coqui XTTS (GPU) + Edge-TTS (cloud) in parallel...")
+                    return self._tts_hybrid_coqui_edge(segments)
+            except ImportError:
+                pass
+            except Exception as e:
+                self._report("synthesize", 0.05,
+                             f"Hybrid TTS failed ({e}) — trying single engine...")
 
         if self.cfg.use_coqui_xtts:
             try:
@@ -2734,6 +2762,76 @@ class Pipeline:
         else:
             self._report("synthesize", 0.05, f"Using Edge-TTS ({voice}) for {target_name}...")
         return self._tts_edge(segments, voice_map=self._voice_map)
+
+    def _tts_hybrid_coqui_edge(self, segments):
+        """HYBRID: Split segments between Coqui XTTS (GPU) and Edge-TTS (cloud).
+
+        Coqui runs on GPU (sequential but high quality voice cloning).
+        Edge-TTS runs on cloud (highly parallel, native voices).
+        Both run simultaneously in separate threads = ~2x faster.
+        """
+        import threading
+
+        # Split: even-indexed segments → Coqui XTTS, odd-indexed → Edge-TTS
+        coqui_segments = [(i, seg) for i, seg in enumerate(segments) if i % 2 == 0]
+        edge_segments = [(i, seg) for i, seg in enumerate(segments) if i % 2 == 1]
+
+        coqui_results = {}
+        edge_results = {}
+        errors = []
+
+        self._report("synthesize", 0.05,
+                     f"Hybrid: {len(coqui_segments)} segs → Coqui GPU, {len(edge_segments)} segs → Edge-TTS cloud")
+
+        def run_coqui():
+            try:
+                # Create a sub-list of just the coqui segments
+                coqui_segs_only = [seg for _, seg in coqui_segments]
+                results = self._tts_coqui_xtts(coqui_segs_only)
+                for result, (orig_idx, _) in zip(results, coqui_segments):
+                    coqui_results[orig_idx] = result
+            except Exception as e:
+                errors.append(f"Coqui: {e}")
+
+        def run_edge():
+            try:
+                edge_segs_only = [seg for _, seg in edge_segments]
+                results = self._tts_edge(edge_segs_only, voice_map=self._voice_map)
+                for result, (orig_idx, _) in zip(results, edge_segments):
+                    edge_results[orig_idx] = result
+            except Exception as e:
+                errors.append(f"Edge: {e}")
+
+        # Launch both in parallel
+        t_coqui = threading.Thread(target=run_coqui, name="tts-coqui")
+        t_edge = threading.Thread(target=run_edge, name="tts-edge")
+        t_coqui.start()
+        t_edge.start()
+        t_coqui.join()
+        t_edge.join()
+
+        # If Coqui failed, Edge may have succeeded for its half
+        if errors:
+            self._report("synthesize", 0.85,
+                         f"Hybrid partial errors: {'; '.join(errors)}")
+
+        # Merge results in original order
+        all_results = {**coqui_results, **edge_results}
+
+        # If Coqui failed entirely, re-generate its segments via Edge-TTS
+        if not coqui_results and coqui_segments:
+            self._report("synthesize", 0.85,
+                         "Coqui failed — re-generating its segments via Edge-TTS...")
+            coqui_segs_only = [seg for _, seg in coqui_segments]
+            fallback_results = self._tts_edge(coqui_segs_only, voice_map=self._voice_map)
+            for result, (orig_idx, _) in zip(fallback_results, coqui_segments):
+                all_results[orig_idx] = result
+
+        # Sort by original segment index
+        tts_data = [all_results[i] for i in sorted(all_results.keys())]
+        self._report("synthesize", 0.9,
+                     f"Hybrid TTS complete: {len(tts_data)} segments")
+        return tts_data
 
     def _tts_chatterbox(self, segments):
         """Generate TTS using Chatterbox — free, local, human-like AI voice."""

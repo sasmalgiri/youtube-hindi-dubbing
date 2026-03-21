@@ -412,6 +412,7 @@ def list_jobs():
             "created_at": j.created_at,
             "saved_folder": j.saved_folder,
             "saved_video": j.saved_video,
+            "description": j.description,
         }
         for j in jobs
     ]
@@ -440,6 +441,8 @@ async def create_job_upload(
     file: UploadFile = File(...),
     source_language: str = Form("auto"),
     target_language: str = Form("hi"),
+    asr_model: str = Form("large-v3"),
+    translation_engine: str = Form("auto"),
     tts_rate: str = Form("+0%"),
     mix_original: bool = Form(False),
     original_volume: float = Form(0.10),
@@ -451,6 +454,9 @@ async def create_job_upload(
     prefer_youtube_subs: bool = Form(False),
     multi_speaker: bool = Form(False),
     transcribe_only: bool = Form(False),
+    audio_priority: bool = Form(True),
+    audio_bitrate: str = Form("192k"),
+    encode_preset: str = Form("veryfast"),
     voice: str = Form("hi-IN-SwaraNeural"),
 ):
     """Create a dubbing job from an uploaded video file."""
@@ -478,6 +484,8 @@ async def create_job_upload(
         source_language=source_language,
         target_language=target_language,
         voice=voice,
+        asr_model=asr_model,
+        translation_engine=translation_engine,
         tts_rate=tts_rate,
         mix_original=mix_original,
         original_volume=original_volume,
@@ -489,6 +497,9 @@ async def create_job_upload(
         prefer_youtube_subs=prefer_youtube_subs,
         multi_speaker=multi_speaker,
         transcribe_only=transcribe_only,
+        audio_priority=audio_priority,
+        audio_bitrate=audio_bitrate,
+        encode_preset=encode_preset,
     )
     job.original_req = req
 
@@ -503,7 +514,18 @@ def _job_config(job: Job) -> Dict[str, Any]:
     req = job.original_req
     if not req:
         return {}
-    tts = "Chatterbox" if req.use_chatterbox else "ElevenLabs" if req.use_elevenlabs else "Coqui XTTS" if req.use_coqui_xtts else "Google TTS" if req.use_google_tts else "Edge-TTS" if req.use_edge_tts else "Edge-TTS"
+    if req.use_coqui_xtts and req.use_edge_tts:
+        tts = "Hybrid (Coqui+Edge)"
+    elif req.use_chatterbox:
+        tts = "Chatterbox"
+    elif req.use_elevenlabs:
+        tts = "ElevenLabs"
+    elif req.use_coqui_xtts:
+        tts = "Coqui XTTS"
+    elif req.use_google_tts:
+        tts = "Google TTS"
+    else:
+        tts = "Edge-TTS"
     engine_labels = {
         "auto": "Auto", "turbo": "Turbo (Multi-Engine)", "gemini": "Gemini",
         "groq": "Groq", "sambanova": "SambaNova",
@@ -655,6 +677,9 @@ def _run_resume(job: Job):
             use_edge_tts=req.use_edge_tts if req else True,
             mix_original=req.mix_original if req else False,
             original_volume=req.original_volume if req else 0.10,
+            audio_priority=req.audio_priority if req else True,
+            audio_bitrate=req.audio_bitrate if req else "192k",
+            encode_preset=req.encode_preset if req else "veryfast",
         )
 
         pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job))

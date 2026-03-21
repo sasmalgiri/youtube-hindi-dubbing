@@ -121,7 +121,7 @@ export function useBatchManager(): UseBatchManagerReturn {
 
                     if (event.step) updates.step = event.step;
                     if (event.message) updates.message = event.message;
-                    if (event.overall !== undefined) updates.progress = event.overall;
+                    if (event.overall !== undefined) updates.progress = event.overall * 100;
 
                     if (event.type === 'complete' || event.state === 'done') {
                         updates.state = 'done';
