@@ -64,6 +64,7 @@ export function useBatchManager(): UseBatchManagerReturn {
     const [autoDownload, setAutoDownload] = useState(true);
     const unsubscribesRef = useRef<Map<string, () => void>>(new Map());
     const startedRef = useRef(false);
+    const launchingRef = useRef<Set<number>>(new Set());
 
     // Load from sessionStorage on mount
     useEffect(() => {
@@ -187,16 +188,20 @@ export function useBatchManager(): UseBatchManagerReturn {
     useEffect(() => {
         if (!startedRef.current || items.length === 0) return;
 
-        const runningCount = items.filter((i) => i.state === 'creating' || i.state === 'running').length;
+        const runningCount = items.filter((i) => i.state === 'creating' || i.state === 'running').length
+            + launchingRef.current.size;
         if (runningCount >= MAX_CONCURRENT) return;
 
         const slotsAvailable = MAX_CONCURRENT - runningCount;
         const pendingIndices = items
-            .map((item, idx) => (item.state === 'pending' ? idx : -1))
+            .map((item, idx) => (item.state === 'pending' && !launchingRef.current.has(idx) ? idx : -1))
             .filter((idx) => idx >= 0);
 
         const toStart = pendingIndices.slice(0, slotsAvailable);
         if (toStart.length === 0) return;
+
+        // Mark indices as launching to prevent double-creation on effect re-fire
+        toStart.forEach((idx) => launchingRef.current.add(idx));
 
         // Create jobs for each pending item
         toStart.forEach(async (index) => {
@@ -232,6 +237,7 @@ export function useBatchManager(): UseBatchManagerReturn {
                     ? await localDownloadAndDub(item.url, jobReq)
                     : await createJob({ url: item.url, ...jobReq });
 
+                launchingRef.current.delete(index);
                 updateItem(index, {
                     jobId: id,
                     state: 'running',
@@ -241,6 +247,7 @@ export function useBatchManager(): UseBatchManagerReturn {
                 // Subscribe to SSE events
                 subscribeToJob(index, id);
             } catch (e) {
+                launchingRef.current.delete(index);
                 updateItem(index, {
                     state: 'error',
                     error: e instanceof Error ? e.message : 'Failed to create job',
