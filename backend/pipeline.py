@@ -1729,7 +1729,7 @@ class Pipeline:
                         "https://api.cerebras.ai/v1/chat/completions",
                         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                         json={
-                            "model": "llama-3.3-70b",
+                            "model": "qwen-3-235b-a22b-instruct-2507",
                             "messages": [
                                 {"role": "system", "content": system_msg},
                                 {"role": "user", "content": user_msg},
@@ -1808,7 +1808,7 @@ class Pipeline:
                         headers={"Authorization": f"Bearer {cerebras_key}",
                                  "Content-Type": "application/json"},
                         json={
-                            "model": "llama-3.3-70b",
+                            "model": "qwen-3-235b-a22b-instruct-2507",
                             "messages": [
                                 {"role": "system", "content": system_msg},
                                 {"role": "user", "content": user_msg},
