@@ -81,7 +81,7 @@ class JobCreateRequest(BaseModel):
     prefer_youtube_subs: bool = False
     multi_speaker: bool = False
     transcribe_only: bool = False
-    audio_priority: bool = False
+    audio_priority: bool = True
     audio_bitrate: str = "192k"
     encode_preset: str = "veryfast"
 
@@ -142,12 +142,24 @@ def _calc_overall(step: str, step_progress: float) -> float:
 
 def _sanitize_filename(name: str) -> str:
     """Convert a video title to a safe folder/file name."""
-    # Remove or replace unsafe characters
-    name = re.sub(r'[<>:"/\\|?*]', '', name)
+    # Remove null bytes and control characters
+    name = re.sub(r'[\x00-\x1f\x7f]', '', name)
+    # Remove or replace characters unsafe on Windows/Linux/Mac
+    name = re.sub(r'[<>:"/\\|?*#%&{}$!\'`@^+= ,;]', ' ', name)
+    # Remove leading/trailing dots and spaces (Windows issue)
+    name = name.strip('. ')
+    # Collapse multiple spaces
     name = re.sub(r'\s+', ' ', name).strip()
-    # Truncate to avoid filesystem limits
-    if len(name) > 120:
-        name = name[:120].rsplit(' ', 1)[0]
+    # Remove emoji and non-BMP characters that cause filesystem issues
+    name = re.sub(r'[^\x20-\x7E\u0900-\u097F\u0980-\u09FF\u0A00-\u0A7F\u0A80-\u0AFF\u0B00-\u0B7F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\u0D00-\u0D7F\u0D80-\u0DFF\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]', '', name)
+    # Truncate to avoid filesystem limits (keep at word boundary)
+    if len(name) > 100:
+        name = name[:100].rsplit(' ', 1)[0]
+    # Avoid reserved Windows names
+    reserved = {'CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'COM3', 'COM4',
+                'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 'LPT1', 'LPT2', 'LPT3'}
+    if name.upper().split('.')[0] in reserved:
+        name = f"_{name}"
     return name or "Untitled"
 
 

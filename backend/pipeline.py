@@ -227,7 +227,6 @@ class PipelineConfig:
     audio_bitrate: str = "192k"
     # Video encode speed: ultrafast (fastest), veryfast, fast, medium (best quality)
     encode_preset: str = "veryfast"
-    use_groq_whisper: bool = False
 
 
 class Pipeline:
@@ -611,24 +610,10 @@ class Pipeline:
                          f"Using YouTube subtitles ({len(sub_segments)} segments, skipped Whisper)")
         else:
             if self.cfg.prefer_youtube_subs:
-                self._report("transcribe", 0.05, "No subtitles found...")
-            # Try Groq Whisper API first (very fast), fall back to local Whisper
-            groq_key = os.environ.get("GROQ_API_KEY", "").strip()
-            if self.cfg.use_groq_whisper and groq_key:
-                self._report("transcribe", 0.1, "Transcribing via Groq Whisper API (fast)...")
-                try:
-                    self.segments = self._transcribe_groq(audio_raw, groq_key)
-                    self._report("transcribe", 1.0,
-                                 f"Transcribed {len(self.segments)} segments via Groq API")
-                except Exception as e:
-                    self._report("transcribe", 0.1,
-                                 f"Groq API failed ({e}), falling back to local Whisper...")
-                    self.segments = self._transcribe(audio_raw)
-                    self._report("transcribe", 1.0, f"Transcribed {len(self.segments)} segments")
-            else:
-                self._report("transcribe", 0.1, "Loading ASR model...")
-                self.segments = self._transcribe(audio_raw)
-                self._report("transcribe", 1.0, f"Transcribed {len(self.segments)} segments")
+                self._report("transcribe", 0.05, "No subtitles found, using Whisper...")
+            self._report("transcribe", 0.1, "Loading ASR model...")
+            self.segments = self._transcribe(audio_raw)
+            self._report("transcribe", 1.0, f"Transcribed {len(self.segments)} segments")
 
         text_segments = [s for s in self.segments if s.get("text", "").strip()]
         if not text_segments:
@@ -684,13 +669,19 @@ class Pipeline:
         self._report("synthesize", 0.9,
                      f"Generated {len(tts_data)} segments, speeding up to 1.25x...")
 
-        # Speed up all TTS clips to 1.25x for snappier delivery
+        # Speed up all TTS clips to 1.25x for snappier delivery (parallel)
         TTS_SPEED = 1.25
-        for idx, tts in enumerate(tts_data):
+        from concurrent.futures import ThreadPoolExecutor
+
+        def speedup_one(idx_tts):
+            idx, tts = idx_tts
             sped_wav = self.cfg.work_dir / f"tts_fast_{idx:04d}.wav"
             self._time_stretch(tts["wav"], TTS_SPEED, sped_wav)
             tts["wav"] = sped_wav
             tts["duration"] = tts["duration"] / TTS_SPEED
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(speedup_one, enumerate(tts_data)))
 
         self._report("synthesize", 1.0,
                      f"All {len(tts_data)} segments at 1.25x speed")
@@ -1090,12 +1081,12 @@ class Pipeline:
 
         self._report("transcribe", 0.2, "Transcribing audio with word timestamps...")
         # Pass language hint if source language is specified (not auto)
+        # beam_size=1 + best_of=1 = greedy decoding (much faster, minimal quality loss)
         transcribe_kwargs = {
             "vad_filter": True,
             "word_timestamps": True,
-            "beam_size": 5,
-            "best_of": 5,
-            "patience": 2.0,
+            "beam_size": 1,
+            "best_of": 1,
             "condition_on_previous_text": True,
             "no_speech_threshold": 0.5,
             "compression_ratio_threshold": 2.4,
@@ -1127,116 +1118,6 @@ class Pipeline:
             )
 
         return segments
-
-    # ── Step 3c: Transcribe via Groq Whisper API (fast cloud) ────────────
-    def _transcribe_groq(self, wav_path: Path, api_key: str) -> List[Dict]:
-        """Transcribe using Groq's Whisper API — extremely fast cloud transcription."""
-        from groq import Groq
-        import tempfile
-        import subprocess as sp
-
-        client = Groq(api_key=api_key)
-
-        # Groq Whisper API accepts files up to 25MB. Convert to mp3 to reduce size.
-        self._report("transcribe", 0.15, "Converting audio for Groq API...")
-        mp3_path = wav_path.parent / "audio_for_groq.mp3"
-        sp.run([
-            self._ffmpeg, "-y", "-i", str(wav_path),
-            "-ac", "1", "-ar", "16000", "-b:a", "64k",
-            str(mp3_path),
-        ], capture_output=True, check=True)
-
-        file_size = mp3_path.stat().st_size
-        max_size = 25 * 1024 * 1024  # 25MB
-
-        if file_size <= max_size:
-            # Single file — send directly
-            self._report("transcribe", 0.3, "Sending to Groq Whisper API...")
-            with open(mp3_path, "rb") as f:
-                transcribe_kwargs = {
-                    "file": ("audio.mp3", f),
-                    "model": "whisper-large-v3",
-                    "response_format": "verbose_json",
-                    "timestamp_granularities": ["segment", "word"],
-                }
-                if self.cfg.source_language and self.cfg.source_language != "auto":
-                    transcribe_kwargs["language"] = self.cfg.source_language
-
-                result = client.audio.transcriptions.create(**transcribe_kwargs)
-
-            self._report("transcribe", 0.8, "Processing Groq response...")
-            segments = []
-            for seg in (result.segments or []):
-                entry = {
-                    "start": float(seg.get("start", seg["start"])),
-                    "end": float(seg.get("end", seg["end"])),
-                    "text": seg.get("text", "").strip(),
-                }
-                if "words" in seg and seg["words"]:
-                    entry["words"] = [
-                        {"word": w["word"].strip(), "start": float(w["start"]), "end": float(w["end"])}
-                        for w in seg["words"]
-                    ]
-                if entry["text"]:
-                    segments.append(entry)
-            return segments
-        else:
-            # File too large — split into chunks
-            self._report("transcribe", 0.2, f"Audio too large ({file_size // 1024 // 1024}MB), splitting into chunks...")
-            chunk_duration = 600  # 10 min chunks
-            # Get duration
-            probe = sp.run([
-                self._ffmpeg.replace("ffmpeg", "ffprobe"), "-v", "error",
-                "-show_entries", "format=duration", "-of", "csv=p=0",
-                str(mp3_path),
-            ], capture_output=True, text=True)
-            total_duration = float(probe.stdout.strip())
-            n_chunks = int(total_duration / chunk_duration) + 1
-
-            all_segments = []
-            for i in range(n_chunks):
-                start_time = i * chunk_duration
-                chunk_path = wav_path.parent / f"groq_chunk_{i}.mp3"
-                sp.run([
-                    self._ffmpeg, "-y", "-i", str(mp3_path),
-                    "-ss", str(start_time), "-t", str(chunk_duration),
-                    "-ac", "1", "-ar", "16000", "-b:a", "64k",
-                    str(chunk_path),
-                ], capture_output=True, check=True)
-
-                self._report("transcribe", 0.2 + 0.6 * (i / n_chunks),
-                             f"Transcribing chunk {i + 1}/{n_chunks} via Groq...")
-
-                with open(chunk_path, "rb") as f:
-                    transcribe_kwargs = {
-                        "file": ("audio.mp3", f),
-                        "model": "whisper-large-v3",
-                        "response_format": "verbose_json",
-                        "timestamp_granularities": ["segment", "word"],
-                    }
-                    if self.cfg.source_language and self.cfg.source_language != "auto":
-                        transcribe_kwargs["language"] = self.cfg.source_language
-                    result = client.audio.transcriptions.create(**transcribe_kwargs)
-
-                for seg in (result.segments or []):
-                    entry = {
-                        "start": float(seg.get("start", seg["start"])) + start_time,
-                        "end": float(seg.get("end", seg["end"])) + start_time,
-                        "text": seg.get("text", "").strip(),
-                    }
-                    if "words" in seg and seg["words"]:
-                        entry["words"] = [
-                            {"word": w["word"].strip(),
-                             "start": float(w["start"]) + start_time,
-                             "end": float(w["end"]) + start_time}
-                            for w in seg["words"]
-                        ]
-                    if entry["text"]:
-                        all_segments.append(entry)
-
-                chunk_path.unlink(missing_ok=True)
-
-            return all_segments
 
     # ── Step 4: Translate full narrative ─────────────────────────────────
     def _translate_full_narrative(self, text_segments: List[Dict], speech_duration: float = 0) -> tuple:
@@ -1760,7 +1641,7 @@ class Pipeline:
         from groq import Groq
         client = Groq(api_key=api_key)
 
-        batch_size = 30
+        batch_size = 50  # Larger batches = fewer API calls = faster
         total_batches = (len(segments) + batch_size - 1) // batch_size
         system_msg = self._get_translation_prompt("system")
 
@@ -2114,8 +1995,10 @@ class Pipeline:
         if self.cfg.audio_priority:
             return [tts.copy() for tts in tts_data]
 
-        fitted = []
-        for idx, tts in enumerate(tts_data):
+        from concurrent.futures import ThreadPoolExecutor
+
+        def fit_one(idx_tts):
+            idx, tts = idx_tts
             seg_start = tts["start"]
             seg_end = tts["end"]
             slot_dur = seg_end - seg_start
@@ -2123,15 +2006,13 @@ class Pipeline:
             tts_wav = tts["wav"]
 
             if slot_dur < 0.1 or tts_dur < 0.1:
-                fitted.append(tts.copy())
-                continue
+                return (idx, tts.copy())
 
             ratio = tts_dur / slot_dur  # >1 = TTS longer than slot
 
             # Close enough — no adjustment needed
             if abs(ratio - 1.0) < 0.05:
-                fitted.append(tts.copy())
-                continue
+                return (idx, tts.copy())
 
             # Clamp ratio to our speed limits
             clamped_ratio = max(self.SPEED_MIN, min(ratio, self.SPEED_MAX))
@@ -2140,14 +2021,18 @@ class Pipeline:
             self._time_stretch(tts_wav, clamped_ratio, stretched_wav)
 
             new_dur = tts_dur / clamped_ratio  # duration after speed change
-            fitted.append({
+            return (idx, {
                 "start": seg_start,
                 "end": seg_end,
                 "wav": stretched_wav,
                 "duration": new_dur,
             })
 
-        return fitted
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(fit_one, enumerate(tts_data)))
+
+        results.sort(key=lambda x: x[0])
+        return [r[1] for r in results]
 
     def _build_timeline_no_cut(self, tts_data, total_duration, prefix=""):
         """Place TTS segments on a timeline WITHOUT cutting any audio.
@@ -2940,7 +2825,7 @@ class Pipeline:
         import edge_tts
         default_voice = self.cfg.tts_voice
         rate = self.cfg.tts_rate
-        concurrency = 20  # Process 20 segments simultaneously
+        concurrency = 40  # Process 40 segments simultaneously
 
         async def generate_one(i, seg, semaphore):
             text = seg.get("text_translated", seg.get("text", "")).strip()
@@ -2978,11 +2863,13 @@ class Pipeline:
 
         asyncio.run(generate_all())
 
-        tts_data = []
-        for i, seg in enumerate(segments):
+        # Parallel MP3→WAV conversion (8 threads = ~8x faster than sequential)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def convert_one(i, seg):
             mp3 = seg.pop("_tts_mp3", None)
             if not mp3 or not mp3.exists():
-                continue
+                return None
             wav = self.cfg.work_dir / f"tts_{i:04d}.wav"
             subprocess.run(
                 [self._ffmpeg, "-y", "-i", str(mp3),
@@ -2992,13 +2879,24 @@ class Pipeline:
             )
             mp3.unlink(missing_ok=True)
             tts_dur = self._get_duration(wav)
-            tts_data.append({
+            return {
                 "start": seg["start"],
                 "end": seg["end"],
                 "wav": wav,
                 "duration": tts_dur,
-            })
+                "_order": i,
+            }
 
+        tts_data = []
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(convert_one, i, seg): i for i, seg in enumerate(segments)}
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result:
+                    tts_data.append(result)
+
+        # Sort back to original order
+        tts_data.sort(key=lambda x: x.pop("_order"))
         return tts_data
 
     def _build_fitted_audio(self, video_path, audio_raw, tts_data, total_video_duration):
