@@ -576,6 +576,9 @@ async def job_events(job_id: str):
     async def event_generator():
         last_index = 0
         while True:
+            # Detect list reset (e.g. resume cleared events) — resync
+            if last_index > len(job.events):
+                last_index = 0
             if last_index < len(job.events):
                 for event in job.events[last_index:]:
                     yield {"data": json.dumps(event)}
@@ -655,7 +658,7 @@ def _run_resume(job: Job):
     try:
         job.state = "running"
         job.message = "Resuming from uploaded SRT..."
-        job.events = []  # Reset events for fresh SSE stream
+        job.events.clear()  # Clear in-place so SSE generators tracking last_index stay consistent
 
         job_dir = OUTPUTS / job.id
         work_dir = job_dir / "work"
@@ -765,7 +768,9 @@ def get_original_video(job_id: str):
     if not source or not source.exists():
         raise HTTPException(status_code=404, detail="Original video not found")
 
-    return FileResponse(path=str(source), media_type="video/mp4")
+    import mimetypes
+    mime = mimetypes.guess_type(str(source))[0] or "video/mp4"
+    return FileResponse(path=str(source), media_type=mime)
 
 
 @app.get("/api/jobs/{job_id}/description")
@@ -803,9 +808,14 @@ def list_outputs():
 
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: str):
-    job = JOBS.pop(job_id, None)
+    job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.state in ("running", "creating"):
+        raise HTTPException(status_code=409, detail="Cannot delete a running job — wait for it to finish or error out")
+
+    JOBS.pop(job_id, None)
 
     job_dir = OUTPUTS / job_id
     if job_dir.exists():
