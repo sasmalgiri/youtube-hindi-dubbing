@@ -776,9 +776,13 @@ async def resume_with_srt(job_id: str, file: UploadFile = File(...)):
 
     work_dir = OUTPUTS / job_id / "work"
     srt_path = work_dir / "translated_upload.srt"
-    with open(srt_path, "wb") as f:
-        while chunk := await file.read(1024 * 1024):
-            f.write(chunk)
+    try:
+        with open(srt_path, "wb") as f:
+            while chunk := await file.read(1024 * 1024):
+                f.write(chunk)
+    except Exception:
+        job.state = "waiting_for_srt"  # Revert so user can retry
+        raise
 
     t = threading.Thread(target=_run_resume, args=(job,), daemon=True)
     t.start()
