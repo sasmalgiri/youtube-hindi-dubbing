@@ -128,7 +128,13 @@ export function useBatchManager(): UseBatchManagerReturn {
                     if (event.message) updates.message = event.message;
                     if (event.overall !== undefined) updates.progress = event.overall * 100;
 
-                    if (event.state === 'waiting_for_srt') {
+                    if (event.state === 'error' || event.type === 'error') {
+                        updates.state = 'error';
+                        updates.error = event.error || 'Job failed';
+                        unsubscribesRef.current.get(jobId)?.();
+                        unsubscribesRef.current.delete(jobId);
+                    } else if (event.state === 'waiting_for_srt') {
+                        updates.state = 'done'; // Free the queue slot
                         updates.step = 'Awaiting SRT';
                         updates.message = 'Transcription complete. Open job page to upload SRT.';
                         unsubscribesRef.current.get(jobId)?.();
@@ -136,7 +142,6 @@ export function useBatchManager(): UseBatchManagerReturn {
                     } else if (event.type === 'complete' || event.state === 'done') {
                         updates.state = 'done';
                         updates.progress = 100;
-                        // Unsubscribe
                         unsubscribesRef.current.get(jobId)?.();
                         unsubscribesRef.current.delete(jobId);
                         // Fetch video title for proper download filename
@@ -145,13 +150,6 @@ export function useBatchManager(): UseBatchManagerReturn {
                                 updateItem(index, { videoTitle: job.video_title });
                             }
                         }).catch(() => {});
-                    }
-
-                    if (event.state === 'error' || event.type === 'error') {
-                        updates.state = 'error';
-                        updates.error = event.error || 'Job failed';
-                        unsubscribesRef.current.get(jobId)?.();
-                        unsubscribesRef.current.delete(jobId);
                     }
 
                     next[index] = { ...item, ...updates };
@@ -171,16 +169,14 @@ export function useBatchManager(): UseBatchManagerReturn {
     // Auto-download effect
     useEffect(() => {
         if (!autoDownload) return;
-        items.forEach((item) => {
-            if (item.state === 'done' && !item.downloaded && item.jobId) {
-                triggerDownload(item.jobId, item.videoTitle);
-                setItems((prev) => {
-                    const next = [...prev];
-                    const idx = next.findIndex((i) => i.jobId === item.jobId);
-                    if (idx >= 0) next[idx] = { ...next[idx], downloaded: true };
-                    return next;
-                });
-            }
+        const toDownload = items.filter((item) => item.state === 'done' && !item.downloaded && item.jobId);
+        if (toDownload.length === 0) return;
+        toDownload.forEach((item) => triggerDownload(item.jobId!, item.videoTitle));
+        setItems((prev) => {
+            const downloadedIds = new Set(toDownload.map((i) => i.jobId));
+            return prev.map((item) =>
+                downloadedIds.has(item.jobId) ? { ...item, downloaded: true } : item
+            );
         });
     }, [items, autoDownload, triggerDownload]);
 

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { readFile, unlink, mkdtemp } from 'fs/promises';
+import { readFile, mkdtemp, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import path from 'path';
 
@@ -86,11 +86,7 @@ export async function POST(req: NextRequest) {
     } finally {
         // Cleanup temp file
         try {
-            if (videoPath) await unlink(videoPath).catch(() => {});
-            if (tempDir) {
-                const { rmdir } = await import('fs/promises');
-                await rmdir(tempDir).catch(() => {});
-            }
+            if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => {});
         } catch { /* ignore cleanup errors */ }
     }
 }

@@ -169,6 +169,12 @@ export function useJobProgress(jobId: string | null): JobProgress {
         setStepProgress(0);
         setOverallProgress(0);
         setMessage('Resuming...');
+        setEta('');
+        startTimeRef.current = Date.now();
+        lastProgressRef.current = 0;
+
+        // Start polling as reliable fallback (same as initial setup)
+        startPolling(jobId);
 
         const unsub = subscribeToJobEvents(
             jobId,
@@ -186,18 +192,25 @@ export function useJobProgress(jobId: string | null): JobProgress {
                         setOverallProgress(0.4);
                         setMessage('Transcription complete. Download SRT and upload translation.');
                     }
+                    setEta('');
+                    if (pollRef.current) clearInterval(pollRef.current);
                     getJob(jobId).then(setStatus).catch(() => {});
                     return;
                 }
                 if (event.step) setStep(event.step);
                 if (event.progress !== undefined) setStepProgress(event.progress);
-                if (event.overall !== undefined) setOverallProgress(event.overall);
+                if (event.overall !== undefined) {
+                    setOverallProgress(event.overall);
+                    updateEta(event.overall);
+                }
                 if (event.message) setMessage(event.message);
             },
-            () => startPolling(jobId),
+            () => {
+                // SSE failed — polling is already running as backup
+            },
         );
         unsubRef.current = unsub;
-    }, [jobId, startPolling]);
+    }, [jobId, startPolling, updateEta]);
 
     return { status, step, stepProgress, overallProgress, message, isComplete, isError, isWaitingForSrt, error, eta, restart };
 }

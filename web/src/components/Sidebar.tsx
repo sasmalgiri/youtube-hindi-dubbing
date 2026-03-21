@@ -26,6 +26,7 @@ export default function Sidebar({ onNewDubbing }: SidebarProps) {
         running: 'bg-primary/20 text-primary-light',
         done: 'bg-success/20 text-success',
         error: 'bg-error/20 text-error',
+        waiting_for_srt: 'bg-warning/20 text-warning',
     };
 
     return (
