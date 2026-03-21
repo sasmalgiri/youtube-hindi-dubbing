@@ -14,6 +14,7 @@ const stateConfig: Record<string, { color: string; bg: string; label: string }> 
     running: { color: 'text-primary-light', bg: 'bg-primary/10', label: 'Running' },
     done: { color: 'text-success', bg: 'bg-success/10', label: 'Complete' },
     error: { color: 'text-error', bg: 'bg-error/10', label: 'Failed' },
+    waiting_for_srt: { color: 'text-warning', bg: 'bg-warning/10', label: 'Awaiting SRT' },
 };
 
 export default function JobCard({ job, onDelete }: JobCardProps) {
