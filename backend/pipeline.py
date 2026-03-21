@@ -3296,8 +3296,10 @@ class Pipeline:
                 if result:
                     tts_data.append(result)
 
-        # Sort back to original order
-        tts_data.sort(key=lambda x: x.pop("_order"))
+        # Sort back to original order and strip internal key
+        tts_data.sort(key=lambda x: x.get("_order", 0))
+        for t in tts_data:
+            t.pop("_order", None)
         return tts_data
 
     def _build_fitted_audio(self, video_path, audio_raw, tts_data, total_video_duration):
