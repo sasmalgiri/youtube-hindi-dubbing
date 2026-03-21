@@ -31,7 +31,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from sse_starlette.sse import EventSourceResponse
 
 from pipeline import Pipeline, PipelineConfig, list_voices, DEFAULT_VOICES
@@ -85,6 +85,13 @@ class JobCreateRequest(BaseModel):
     audio_bitrate: str = "192k"
     encode_preset: str = "veryfast"
 
+    @validator("target_language", "source_language")
+    def validate_language(cls, v):
+        import re
+        if not re.match(r"^[a-zA-Z]{2,5}(-[a-zA-Z]{2,5})?$|^auto$", v):
+            raise ValueError(f"Invalid language code: {v}")
+        return v
+
 
 # ── Step weights for overall progress ────────────────────────────────────────
 
@@ -101,6 +108,7 @@ STEP_WEIGHTS = {
 # ── Storage ──────────────────────────────────────────────────────────────────
 
 JOBS: Dict[str, Job] = {}
+MAX_JOBS = 200
 BASE_DIR = Path(__file__).resolve().parent
 WORK_ROOT = BASE_DIR / "work"
 OUTPUTS = WORK_ROOT / "outputs"
@@ -171,13 +179,9 @@ def _save_to_titled_folder(job: Job):
     title = _sanitize_filename(job.video_title or "Untitled")
     lang = job.target_language or "hi"
 
-    # Create folder: dubbed_outputs/<Title> [Hindi Dubbed]
-    folder_name = f"{title} [{lang.upper()} Dubbed]"
+    # Create folder: dubbed_outputs/<Title> [LANG Dubbed] (job_id)
+    folder_name = f"{title} [{lang.upper()} Dubbed] ({job.id})"
     folder = SAVED_DIR / folder_name
-
-    # If folder exists, add job id suffix to avoid collision
-    if folder.exists():
-        folder = SAVED_DIR / f"{folder_name} ({job.id})"
     folder.mkdir(parents=True, exist_ok=True)
 
     # Copy video with title as filename
@@ -419,9 +423,23 @@ def list_jobs():
     ]
 
 
+def _cleanup_old_jobs():
+    """Remove oldest completed/errored jobs when limit is exceeded."""
+    if len(JOBS) <= MAX_JOBS:
+        return
+    completed = sorted(
+        [(jid, j) for jid, j in JOBS.items() if j.state in ("done", "error")],
+        key=lambda x: x[1].created_at,
+    )
+    while len(JOBS) > MAX_JOBS and completed:
+        jid, _ = completed.pop(0)
+        JOBS.pop(jid, None)
+
+
 @app.post("/api/jobs")
 def create_job(req: JobCreateRequest):
     """Create a new dubbing job from a YouTube URL."""
+    _cleanup_old_jobs()
     url = req.url.strip()
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
@@ -461,6 +479,7 @@ async def create_job_upload(
     voice: str = Form("hi-IN-SwaraNeural"),
 ):
     """Create a dubbing job from an uploaded video file."""
+    _cleanup_old_jobs()
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file uploaded")
 
@@ -667,12 +686,16 @@ def _run_resume(job: Job):
 
         # Restore TTS settings from original request
         req = job.original_req
+        # Replicate voice defaulting logic from _run_job
+        voice = req.voice if req else "hi-IN-SwaraNeural"
+        if not voice or voice == "hi-IN-SwaraNeural":
+            voice = DEFAULT_VOICES.get(job.target_language, voice)
         cfg = PipelineConfig(
             source="resume",
             work_dir=work_dir,
             output_path=out_path,
             target_language=job.target_language,
-            tts_voice=req.voice if req else "hi-IN-SwaraNeural",
+            tts_voice=voice,
             tts_rate=req.tts_rate if req else "+0%",
             use_chatterbox=req.use_chatterbox if req else False,
             use_elevenlabs=req.use_elevenlabs if req else False,
