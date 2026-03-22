@@ -117,7 +117,9 @@ OUTPUTS = WORK_ROOT / "outputs"
 OUTPUTS.mkdir(parents=True, exist_ok=True)
 
 # Final saved dubbed videos go here, organized by title
-SAVED_DIR = BASE_DIR / "dubbed_outputs"
+# Use D: drive folder if available (user's preferred location), else fallback to local
+_preferred_save = Path("D:/Shirshendu sasmal/youtube dubbed")
+SAVED_DIR = _preferred_save if _preferred_save.exists() else BASE_DIR / "dubbed_outputs"
 SAVED_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── App ──────────────────────────────────────────────────────────────────────
