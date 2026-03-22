@@ -196,6 +196,42 @@ export async function uploadTranslatedSrt(id: string, file: File): Promise<{ id:
     return res.json();
 }
 
+// ── Saved Links (persistent) ─────────────────────────────────────────────────
+
+export interface SavedLink {
+    id: string;
+    url: string;
+    title: string;
+    added_at: number;
+}
+
+export async function getLinks(): Promise<SavedLink[]> {
+    const res = await fetch(`${API_BASE}/api/links`, { headers: { ...EXTRA_HEADERS } });
+    if (!res.ok) return [];
+    return res.json();
+}
+
+export async function addLink(url: string, title?: string): Promise<SavedLink[]> {
+    const res = await fetch(`${API_BASE}/api/links`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...EXTRA_HEADERS },
+        body: JSON.stringify({ url, title }),
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.links || [];
+}
+
+export async function deleteLink(id: string): Promise<SavedLink[]> {
+    const res = await fetch(`${API_BASE}/api/links/${id}`, {
+        method: 'DELETE',
+        headers: { ...EXTRA_HEADERS },
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.links || [];
+}
+
 // ── Local Download + Upload (for remote backend) ────────────────────────────
 
 export const isRemoteBackend = !!API_BASE;

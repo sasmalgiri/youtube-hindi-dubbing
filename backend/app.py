@@ -896,3 +896,55 @@ def delete_job(job_id: str):
         shutil.rmtree(job_dir, ignore_errors=True)
 
     return {"status": "deleted"}
+
+
+# ── Saved Links (persistent) ─────────────────────────────────────────────────
+
+LINKS_FILE = BASE_DIR / "saved_links.json"
+
+
+def _load_links() -> List[Dict]:
+    if LINKS_FILE.exists():
+        try:
+            return json.loads(LINKS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+def _save_links(links: List[Dict]):
+    LINKS_FILE.write_text(json.dumps(links, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+@app.get("/api/links")
+def get_links():
+    return _load_links()
+
+
+class LinkAdd(BaseModel):
+    url: str
+    title: Optional[str] = None
+
+
+@app.post("/api/links")
+def add_link(req: LinkAdd):
+    links = _load_links()
+    # Deduplicate by URL
+    if any(l["url"] == req.url for l in links):
+        return {"status": "exists", "links": links}
+    links.append({
+        "id": uuid.uuid4().hex[:12],
+        "url": req.url,
+        "title": req.title or "",
+        "added_at": time.time(),
+    })
+    _save_links(links)
+    return {"status": "added", "links": links}
+
+
+@app.delete("/api/links/{link_id}")
+def delete_link(link_id: str):
+    links = _load_links()
+    links = [l for l in links if l["id"] != link_id]
+    _save_links(links)
+    return {"status": "deleted", "links": links}

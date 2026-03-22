@@ -10,11 +10,19 @@ interface URLInputProps {
     onFileSubmit: (file: File) => void;
     onBatchSubmit?: (urls: string[]) => void;
     disabled?: boolean;
+    url?: string;
+    onUrlChange?: (url: string) => void;
 }
 
-export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, disabled }: URLInputProps) {
+export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, disabled, url: controlledUrl, onUrlChange }: URLInputProps) {
     const [mode, setMode] = useState<InputMode>('url');
-    const [url, setUrl] = useState('');
+    const [internalUrl, setInternalUrl] = useState('');
+
+    const url = controlledUrl ?? internalUrl;
+    const setUrl = (val: string) => {
+        setInternalUrl(val);
+        onUrlChange?.(val);
+    };
     const [file, setFile] = useState<File | null>(null);
     const [dragOver, setDragOver] = useState(false);
     const [batchText, setBatchText] = useState('');

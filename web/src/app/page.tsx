@@ -6,6 +6,7 @@ import URLInput from '@/components/URLInput';
 import LanguageSelector, { LANGUAGES } from '@/components/LanguageSelector';
 import SettingsPanel, { type DubbingSettings } from '@/components/SettingsPanel';
 import JobCard from '@/components/JobCard';
+import SavedLinks from '@/components/SavedLinks';
 import { createJob, createJobUpload, localDownloadAndDub, isRemoteBackend, getJobs, type JobStatus } from '@/lib/api';
 
 
@@ -31,6 +32,7 @@ export default function HomePage() {
         audio_bitrate: '192k',
         encode_preset: 'veryfast',
     });
+    const [currentUrl, setCurrentUrl] = useState('');
     const [submitting, setSubmitting] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [recentJobs, setRecentJobs] = useState<JobStatus[]>([]);
@@ -112,7 +114,12 @@ export default function HomePage() {
                     </div>
 
                     {/* URL Input */}
-                    <URLInput onSubmit={handleSubmit} onFileSubmit={handleFileSubmit} onBatchSubmit={handleBatchSubmit} disabled={submitting} />
+                    <URLInput onSubmit={handleSubmit} onFileSubmit={handleFileSubmit} onBatchSubmit={handleBatchSubmit} disabled={submitting} url={currentUrl} onUrlChange={setCurrentUrl} />
+
+                    {/* Saved Links */}
+                    <div className="mt-4">
+                        <SavedLinks currentUrl={currentUrl} onSelect={setCurrentUrl} />
+                    </div>
 
                     {error && (
                         <div className="mt-4 p-3 rounded-xl bg-error/10 border border-error/20 text-error text-sm">
