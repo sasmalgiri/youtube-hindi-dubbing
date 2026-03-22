@@ -173,6 +173,21 @@ def _sanitize_filename(name: str) -> str:
     return name or "Untitled"
 
 
+def _cleanup_work_dir(work_dir: Path):
+    """Remove intermediate TTS/assembly files from work dir, keep source + transcripts."""
+    keep_patterns = {"source.", "transcript", ".srt", "dubbed"}
+    removed = 0
+    for f in work_dir.iterdir():
+        if f.is_dir():
+            continue
+        if any(p in f.name for p in keep_patterns):
+            continue
+        f.unlink(missing_ok=True)
+        removed += 1
+    if removed:
+        print(f"[CLEANUP] Removed {removed} intermediate files from {work_dir}")
+
+
 def _save_to_titled_folder(job: Job):
     """Copy dubbed video + SRT to a titled folder in dubbed_outputs/."""
     if not job.result_path or not job.result_path.exists():
@@ -370,6 +385,12 @@ def _run_job(job: Job, req: JobCreateRequest):
                 desc_path.write_text(job.description, encoding="utf-8")
         except Exception as desc_err:
             print(f"[WARN] Failed to generate description: {desc_err}")
+
+        # Clean up intermediate work files (adapt_*, TTS clips, etc.)
+        try:
+            _cleanup_work_dir(job_dir / "work")
+        except Exception as clean_err:
+            print(f"[WARN] Failed to clean work dir: {clean_err}")
 
         job.overall_progress = 1.0
         job.state = "done"
@@ -748,6 +769,12 @@ def _run_resume(job: Job):
             if job.saved_folder:
                 desc_path = Path(job.saved_folder) / "description.txt"
                 desc_path.write_text(job.description, encoding="utf-8")
+        except Exception:
+            pass
+
+        # Clean up intermediate work files
+        try:
+            _cleanup_work_dir(OUTPUTS / job.id / "work")
         except Exception:
             pass
 
