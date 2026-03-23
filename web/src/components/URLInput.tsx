@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { extractYouTubeId, isValidYouTubeUrl, getThumbnailUrl } from '@/lib/utils';
-import { addLink } from '@/lib/api';
+import { addLink, type LinkPreset } from '@/lib/api';
 
 type InputMode = 'url' | 'upload' | 'batch';
 
@@ -13,9 +13,10 @@ interface URLInputProps {
     disabled?: boolean;
     url?: string;
     onUrlChange?: (url: string) => void;
+    getPreset?: () => LinkPreset;
 }
 
-export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, disabled, url: controlledUrl, onUrlChange }: URLInputProps) {
+export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, disabled, url: controlledUrl, onUrlChange, getPreset }: URLInputProps) {
     const [mode, setMode] = useState<InputMode>('url');
     const [internalUrl, setInternalUrl] = useState('');
 
@@ -37,21 +38,25 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, disabl
     useEffect(() => {
         if (isValid && url && !savedRef.current.has(url)) {
             savedRef.current.add(url);
-            addLink(url).catch(() => {});
+            addLink(url, undefined, getPreset?.()).catch(() => {});
         }
-    }, [url, isValid]);
+    }, [url, isValid]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    // Batch URL parsing
-    const parsedLines = batchText.split('\n').map(l => l.trim()).filter(Boolean);
+    // Batch URL parsing — split on newlines, commas, spaces, tabs
+    const parsedLines = batchText
+        .split(/[\n,\s]+/)
+        .map(l => l.trim())
+        .filter(Boolean);
     const validUrls = parsedLines.filter(isValidYouTubeUrl);
     const invalidCount = parsedLines.length - validUrls.length;
 
     // Auto-save valid batch URLs
     useEffect(() => {
+        const preset = getPreset?.();
         validUrls.forEach(u => {
             if (!savedRef.current.has(u)) {
                 savedRef.current.add(u);
-                addLink(u).catch(() => {});
+                addLink(u, undefined, preset).catch(() => {});
             }
         });
     }, [batchText]); // eslint-disable-line react-hooks/exhaustive-deps

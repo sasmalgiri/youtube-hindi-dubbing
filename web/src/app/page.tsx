@@ -52,8 +52,8 @@ export default function HomePage() {
         setSubmitting(true);
         setError(null);
         try {
-            // Auto-save URL to saved links
-            addLink(url).catch(() => {});
+            // Auto-save URL to saved links with current preset
+            addLink(url, undefined, { source_language: sourceLanguage, target_language: targetLanguage, ...settings }).catch(() => {});
 
             const jobSettings = {
                 source_language: sourceLanguage,
@@ -91,8 +91,9 @@ export default function HomePage() {
     }, [sourceLanguage, targetLanguage, settings, router]);
 
     const handleBatchSubmit = useCallback((urls: string[]) => {
-        // Auto-save all batch URLs
-        urls.forEach(u => addLink(u).catch(() => {}));
+        // Auto-save all batch URLs with current preset
+        const preset = { source_language: sourceLanguage, target_language: targetLanguage, ...settings };
+        urls.forEach(u => addLink(u, undefined, preset).catch(() => {}));
 
         sessionStorage.setItem('batch_pending', JSON.stringify({
             urls,
@@ -121,7 +122,7 @@ export default function HomePage() {
                     </div>
 
                     {/* URL Input */}
-                    <URLInput onSubmit={handleSubmit} onFileSubmit={handleFileSubmit} onBatchSubmit={handleBatchSubmit} disabled={submitting} url={currentUrl} onUrlChange={setCurrentUrl} />
+                    <URLInput onSubmit={handleSubmit} onFileSubmit={handleFileSubmit} onBatchSubmit={handleBatchSubmit} disabled={submitting} url={currentUrl} onUrlChange={setCurrentUrl} getPreset={() => ({ source_language: sourceLanguage, target_language: targetLanguage, ...settings })} />
 
                     {/* Saved Links */}
                     <div className="mt-4">

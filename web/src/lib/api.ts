@@ -200,11 +200,34 @@ export async function uploadTranslatedSrt(id: string, file: File): Promise<{ id:
 
 // ── Saved Links (persistent) ─────────────────────────────────────────────────
 
+export interface LinkPreset {
+    source_language?: string;
+    target_language?: string;
+    asr_model?: string;
+    translation_engine?: string;
+    tts_rate?: string;
+    mix_original?: boolean;
+    original_volume?: number;
+    use_chatterbox?: boolean;
+    use_elevenlabs?: boolean;
+    use_google_tts?: boolean;
+    use_coqui_xtts?: boolean;
+    use_edge_tts?: boolean;
+    prefer_youtube_subs?: boolean;
+    multi_speaker?: boolean;
+    transcribe_only?: boolean;
+    audio_priority?: boolean;
+    audio_bitrate?: string;
+    encode_preset?: string;
+    dub_chain?: string[];
+}
+
 export interface SavedLink {
     id: string;
     url: string;
     title: string;
     added_at: number;
+    preset?: LinkPreset;
 }
 
 export async function getLinks(): Promise<SavedLink[]> {
@@ -213,11 +236,22 @@ export async function getLinks(): Promise<SavedLink[]> {
     return res.json();
 }
 
-export async function addLink(url: string, title?: string): Promise<SavedLink[]> {
+export async function addLink(url: string, title?: string, preset?: LinkPreset): Promise<SavedLink[]> {
     const res = await fetch(`${API_BASE}/api/links`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...EXTRA_HEADERS },
-        body: JSON.stringify({ url, title }),
+        body: JSON.stringify({ url, title, preset }),
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.links || [];
+}
+
+export async function updateLinkPreset(id: string, preset: LinkPreset): Promise<SavedLink[]> {
+    const res = await fetch(`${API_BASE}/api/links/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...EXTRA_HEADERS },
+        body: JSON.stringify({ preset }),
     });
     if (!res.ok) return [];
     const data = await res.json();

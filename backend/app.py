@@ -1085,26 +1085,47 @@ def get_links():
 class LinkAdd(BaseModel):
     url: str
     title: Optional[str] = None
+    preset: Optional[Dict] = None
 
 
 @app.post("/api/links")
 def add_link(req: LinkAdd):
     links = _load_links()
-    # Deduplicate by URL
-    if any(l["url"] == req.url for l in links):
-        return {"status": "exists", "links": links}
+    # Deduplicate by URL — but update preset if provided
+    for l in links:
+        if l["url"] == req.url:
+            if req.preset:
+                l["preset"] = req.preset
+                _save_links(links)
+            return {"status": "exists", "links": links}
     link_id = uuid.uuid4().hex[:12]
     links.append({
         "id": link_id,
         "url": req.url,
         "title": req.title or "",
         "added_at": time.time(),
+        "preset": req.preset or {},
     })
     _save_links(links)
     # Fetch title in background if not provided
     if not req.title:
         threading.Thread(target=_bg_fetch_title, args=(link_id, req.url), daemon=True).start()
     return {"status": "added", "links": links}
+
+
+class LinkPresetUpdate(BaseModel):
+    preset: Dict
+
+
+@app.patch("/api/links/{link_id}")
+def update_link_preset(link_id: str, req: LinkPresetUpdate):
+    links = _load_links()
+    for l in links:
+        if l["id"] == link_id:
+            l["preset"] = req.preset
+            _save_links(links)
+            return {"status": "updated", "links": links}
+    return {"status": "not_found", "links": links}
 
 
 @app.delete("/api/links/{link_id}")
@@ -1136,7 +1157,8 @@ def _resume_incomplete_links():
             continue
 
         job_id = uuid.uuid4().hex[:12]
-        req = JobCreateRequest(url=url)
+        preset = link.get("preset", {})
+        req = JobCreateRequest(url=url, **{k: v for k, v in preset.items() if k in JobCreateRequest.model_fields})
         job = Job(id=job_id, source_url=url, target_language=req.target_language)
         job.original_req = req
         JOBS[job_id] = job
@@ -1146,9 +1168,7 @@ def _resume_incomplete_links():
         print(f"[STARTUP]   Queued: {url} -> job {job_id}")
 
 
-# Run auto-resume after a short delay to let the server start
-def _startup_resume():
-    time.sleep(3)
-    _resume_incomplete_links()
-
-threading.Thread(target=_startup_resume, daemon=True).start()
+@app.on_event("startup")
+def _on_startup():
+    """Auto-resume incomplete saved links when the server starts."""
+    threading.Thread(target=_resume_incomplete_links, daemon=True).start()
