@@ -17,7 +17,7 @@ def parse_srt(srt_path: Path, text_key: str = "text_translated") -> List[Dict]:
     Extracts [SPEAKER_XX] labels if present in the text.
     Returns: [{"start": float, "end": float, text_key: str, "speaker_id": str (optional)}, ...]
     """
-    content = srt_path.read_text(encoding="utf-8")
+    content = srt_path.read_text(encoding="utf-8-sig")
     segments = []
     # Split on blank lines to get blocks
     blocks = re.split(r"\n\s*\n", content.strip())
@@ -60,14 +60,15 @@ def _fmt_time(t: float) -> str:
 def write_srt(segments: List[Dict], out_path: Path, text_key: str = "text",
               include_speaker: bool = False):
     lines = []
-    for i, seg in enumerate(sorted(segments, key=lambda s: s["start"]), start=1):
+    idx = 0
+    for seg in sorted(segments, key=lambda s: s["start"]):
         start = _fmt_time(seg["start"])
         end = _fmt_time(seg["end"])
         text = seg.get(text_key, "").strip()
         if text:
-            # Optionally prepend speaker label so translator can preserve it
+            idx += 1
             if include_speaker and "speaker_id" in seg:
                 text = f"[{seg['speaker_id']}] {text}"
-            lines.append(f"{i}\n{start} --> {end}\n{text}\n")
+            lines.append(f"{idx}\n{start} --> {end}\n{text}\n")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(lines), encoding="utf-8")
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

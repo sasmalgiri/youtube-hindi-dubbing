@@ -33,6 +33,7 @@ export interface JobCreateRequest {
     use_coqui_xtts?: boolean;
     use_edge_tts?: boolean;
     prefer_youtube_subs?: boolean;
+    use_yt_translate?: boolean;
     multi_speaker?: boolean;
     transcribe_only?: boolean;
     audio_priority?: boolean;
@@ -120,7 +121,15 @@ export async function createJobUpload(
     const form = new FormData();
     form.append('file', file);
     Object.entries(settings).forEach(([key, val]) => {
-        if (val !== undefined) form.append(key, String(val));
+        if (val === undefined || val === null) return;
+        // Skip false booleans — FastAPI parses non-empty strings as True
+        if (typeof val === 'boolean') {
+            if (val) form.append(key, 'true');
+            return;
+        }
+        // Skip arrays (dub_chain) — not supported by upload endpoint
+        if (Array.isArray(val)) return;
+        form.append(key, String(val));
     });
 
     const res = await fetch(`${API_BASE}/api/jobs/upload`, {
@@ -214,6 +223,7 @@ export interface LinkPreset {
     use_coqui_xtts?: boolean;
     use_edge_tts?: boolean;
     prefer_youtube_subs?: boolean;
+    use_yt_translate?: boolean;
     multi_speaker?: boolean;
     transcribe_only?: boolean;
     audio_priority?: boolean;
@@ -228,6 +238,7 @@ export interface SavedLink {
     title: string;
     added_at: number;
     preset?: LinkPreset;
+    completed?: boolean;
 }
 
 export async function getLinks(): Promise<SavedLink[]> {

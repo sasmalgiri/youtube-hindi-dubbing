@@ -14,6 +14,7 @@ export interface DubbingSettings {
     use_coqui_xtts: boolean;
     use_edge_tts: boolean;
     prefer_youtube_subs: boolean;
+    use_yt_translate: boolean;
     multi_speaker: boolean;
     transcribe_only: boolean;
     audio_priority: boolean;
@@ -102,6 +103,26 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                                     <div className={`
                                         w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
                                         ${settings.prefer_youtube_subs ? 'translate-x-6' : 'translate-x-1'}
+                                    `} />
+                                </button>
+                            </div>
+
+                            {/* YouTube Auto-Translate */}
+                            <div className="flex items-center justify-between">
+                                <div>
+                                    <p className="text-sm text-text-primary">YT Auto-Translate</p>
+                                    <p className="text-xs text-text-muted">Use YouTube&apos;s translated subs (skips Whisper + translation)</p>
+                                </div>
+                                <button
+                                    onClick={() => update({ use_yt_translate: !settings.use_yt_translate })}
+                                    className={`
+                                        w-11 h-6 rounded-full transition-colors relative
+                                        ${settings.use_yt_translate ? 'bg-primary' : 'bg-white/10'}
+                                    `}
+                                >
+                                    <div className={`
+                                        w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                        ${settings.use_yt_translate ? 'translate-x-6' : 'translate-x-1'}
                                     `} />
                                 </button>
                             </div>

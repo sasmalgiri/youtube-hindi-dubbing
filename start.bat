@@ -44,11 +44,11 @@ if %errorlevel% neq 0 (
 set PYTHONIOENCODING=utf-8
 chcp 65001 >nul 2>&1
 
-:: Start Backend
+:: Start Backend (cmd /k keeps window open if server crashes so you can see the error)
 echo.
 echo  Starting backend server on http://localhost:8000 ...
 cd /d "%~dp0backend"
-start "VoiceDub Backend" /min cmd /c "%PYTHON% -m uvicorn app:app --host 0.0.0.0 --port 8000 2>&1"
+start "VoiceDub Backend" /min cmd /k "%PYTHON% -m uvicorn app:app --host 0.0.0.0 --port 8000"
 
 :: Wait for backend to be ready
 timeout /t 3 /nobreak >nul
@@ -60,7 +60,7 @@ if not exist node_modules (
     echo  Installing frontend dependencies...
     call npm install
 )
-start "VoiceDub Frontend" /min cmd /c "npm run dev 2>&1"
+start "VoiceDub Frontend" /min cmd /k "npm run dev"
 
 :: Wait for frontend
 timeout /t 5 /nobreak >nul

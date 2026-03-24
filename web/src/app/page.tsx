@@ -26,6 +26,7 @@ export default function HomePage() {
         use_coqui_xtts: false,
         use_edge_tts: false,
         prefer_youtube_subs: false,
+        use_yt_translate: false,
         multi_speaker: false,
         transcribe_only: false,
         audio_priority: true,
@@ -126,7 +127,7 @@ export default function HomePage() {
 
                     {/* Saved Links */}
                     <div className="mt-4">
-                        <SavedLinks onSelect={setCurrentUrl} />
+                        <SavedLinks onSelect={setCurrentUrl} onJobStarted={(id) => router.push(`/jobs/${id}`)} />
                     </div>
 
                     {error && (

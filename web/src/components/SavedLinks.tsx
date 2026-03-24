@@ -1,11 +1,12 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { getLinks, deleteLink, updateLinkPreset, type SavedLink, type LinkPreset } from '@/lib/api';
+import { getLinks, deleteLink, updateLinkPreset, createJob, type SavedLink, type LinkPreset } from '@/lib/api';
 import { extractYouTubeId, getThumbnailUrl } from '@/lib/utils';
 
 interface SavedLinksProps {
     onSelect: (url: string) => void;
+    onJobStarted?: (jobId: string) => void;
 }
 
 const PRESET_LABELS: { key: keyof LinkPreset; label: string; type: 'select' | 'toggle'; options?: { value: string; label: string }[] }[] = [
@@ -26,6 +27,7 @@ const PRESET_LABELS: { key: keyof LinkPreset; label: string; type: 'select' | 't
             { value: 'auto', label: 'Auto' }, { value: 'turbo', label: 'Turbo' },
             { value: 'groq', label: 'Groq' }, { value: 'sambanova', label: 'SambaNova' },
             { value: 'gemini', label: 'Gemini' }, { value: 'google', label: 'Google' },
+            { value: 'ollama', label: 'Ollama' }, { value: 'hinglish', label: 'Hinglish' },
         ],
     },
     {
@@ -47,6 +49,7 @@ const PRESET_LABELS: { key: keyof LinkPreset; label: string; type: 'select' | 't
     { key: 'use_coqui_xtts', label: 'Coqui XTTS', type: 'toggle' },
     { key: 'mix_original', label: 'Mix BG Music', type: 'toggle' },
     { key: 'prefer_youtube_subs', label: 'YT Subs', type: 'toggle' },
+    { key: 'use_yt_translate', label: 'YT Translate', type: 'toggle' },
     { key: 'audio_priority', label: 'Audio Priority', type: 'toggle' },
 ];
 
@@ -60,6 +63,7 @@ function PresetSummary({ preset }: { preset?: LinkPreset }) {
     if (preset.use_coqui_xtts) parts.push('XTTS');
     if (preset.mix_original) parts.push('BG');
     if (preset.prefer_youtube_subs) parts.push('YTSub');
+    if (preset.use_yt_translate) parts.push('YT-TR');
     return <span className="text-primary-light">{parts.join(' · ') || 'Default'}</span>;
 }
 
@@ -68,11 +72,13 @@ function PresetEditor({ preset, onSave }: { preset: LinkPreset; onSave: (p: Link
     const timerRef = useRef<ReturnType<typeof setTimeout>>();
 
     const update = (key: keyof LinkPreset, value: unknown) => {
-        const next = { ...local, [key]: value };
-        setLocal(next);
-        // Debounce saves to avoid rapid-fire API calls
-        clearTimeout(timerRef.current);
-        timerRef.current = setTimeout(() => onSave(next), 500);
+        setLocal(prev => {
+            const next = { ...prev, [key]: value };
+            // Debounce saves to avoid rapid-fire API calls
+            clearTimeout(timerRef.current);
+            timerRef.current = setTimeout(() => onSave(next), 500);
+            return next;
+        });
     };
 
     return (
@@ -108,10 +114,11 @@ function PresetEditor({ preset, onSave }: { preset: LinkPreset; onSave: (p: Link
     );
 }
 
-export default function SavedLinks({ onSelect }: SavedLinksProps) {
+export default function SavedLinks({ onSelect, onJobStarted }: SavedLinksProps) {
     const [links, setLinks] = useState<SavedLink[]>([]);
     const [open, setOpen] = useState(false);
     const [editingId, setEditingId] = useState<string | null>(null);
+    const [queuingId, setQueuingId] = useState<string | null>(null);
 
     const loadLinks = useCallback(() => {
         getLinks().then(setLinks).catch(() => {});
@@ -134,6 +141,19 @@ export default function SavedLinks({ onSelect }: SavedLinksProps) {
         const updated = await updateLinkPreset(id, preset);
         if (updated.length > 0) setLinks(updated);
     }, []);
+
+    const handleQueue = useCallback(async (link: SavedLink) => {
+        setQueuingId(link.id);
+        try {
+            const preset = link.preset || {};
+            const { id } = await createJob({ url: link.url, ...preset });
+            onJobStarted?.(id);
+        } catch (e) {
+            console.error('Failed to queue:', e);
+        } finally {
+            setQueuingId(null);
+        }
+    }, [onJobStarted]);
 
     return (
         <div className="glass-card overflow-hidden">
@@ -180,14 +200,25 @@ export default function SavedLinks({ onSelect }: SavedLinksProps) {
                                         key={link.id}
                                         className="border-b border-border/30 last:border-0"
                                     >
-                                        <div className="flex items-center gap-3 p-3 hover:bg-white/[0.03] transition-colors group">
+                                        <div className={`flex items-center gap-3 p-3 hover:bg-white/[0.03] transition-colors group ${link.completed ? 'bg-green-500/[0.05]' : ''}`}>
                                             {/* Thumbnail */}
                                             {videoId && (
-                                                <img
-                                                    src={getThumbnailUrl(videoId)}
-                                                    alt=""
-                                                    className="w-20 h-12 object-cover rounded-md flex-shrink-0"
-                                                />
+                                                <div className="relative flex-shrink-0">
+                                                    <img
+                                                        src={getThumbnailUrl(videoId)}
+                                                        alt=""
+                                                        className={`w-20 h-12 object-cover rounded-md ${link.completed ? 'opacity-70' : ''}`}
+                                                    />
+                                                    {link.completed && (
+                                                        <div className="absolute inset-0 flex items-center justify-center">
+                                                            <div className="bg-green-500 rounded-full p-0.5">
+                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                                                                    <polyline points="20 6 9 17 4 12" />
+                                                                </svg>
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                </div>
                                             )}
 
                                             {/* URL + title + preset summary */}
@@ -195,9 +226,14 @@ export default function SavedLinks({ onSelect }: SavedLinksProps) {
                                                 className="flex-1 min-w-0 cursor-pointer"
                                                 onClick={() => onSelect(link.url)}
                                             >
-                                                {link.title && (
-                                                    <p className="text-sm text-text-primary truncate">{link.title}</p>
-                                                )}
+                                                <div className="flex items-center gap-1.5">
+                                                    {link.title && (
+                                                        <p className="text-sm text-text-primary truncate">{link.title}</p>
+                                                    )}
+                                                    {link.completed && (
+                                                        <span className="text-[10px] bg-green-500/20 text-green-400 px-1.5 py-0.5 rounded-full flex-shrink-0">Done</span>
+                                                    )}
+                                                </div>
                                                 <p className="text-xs text-text-muted truncate">{link.url}</p>
                                                 <p className="text-[10px] mt-0.5">
                                                     <PresetSummary preset={link.preset} />
@@ -217,15 +253,15 @@ export default function SavedLinks({ onSelect }: SavedLinksProps) {
                                                         <circle cx="12" cy="12" r="3" />
                                                     </svg>
                                                 </button>
-                                                {/* Use button */}
+                                                {/* Queue dubbing button */}
                                                 <button
-                                                    onClick={() => onSelect(link.url)}
-                                                    className="p-1.5 rounded-md hover:bg-primary/20 text-text-muted hover:text-primary transition-colors"
-                                                    title="Use this URL"
+                                                    onClick={() => handleQueue(link)}
+                                                    disabled={queuingId === link.id}
+                                                    className={`p-1.5 rounded-md transition-colors ${queuingId === link.id ? 'bg-primary/30 text-primary animate-pulse' : 'hover:bg-primary/20 text-text-muted hover:text-primary'}`}
+                                                    title="Start dubbing with preset"
                                                 >
                                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                                        <path d="m5 8 6 4-6 4V8Z" />
-                                                        <path d="m13 8 6 4-6 4V8Z" />
+                                                        <polygon points="5 3 19 12 5 21 5 3" />
                                                     </svg>
                                                 </button>
                                                 {/* Delete button */}

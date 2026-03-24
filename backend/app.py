@@ -65,6 +65,7 @@ class Job:
     qa_score: Optional[float] = None    # Transcription QA score (0-1)
     chain_languages: List[str] = field(default_factory=list)  # Remaining languages in chain
     chain_parent_id: Optional[str] = None  # Parent job ID in chain
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
 class JobCreateRequest(BaseModel):
@@ -83,6 +84,7 @@ class JobCreateRequest(BaseModel):
     use_coqui_xtts: bool = False
     use_edge_tts: bool = False
     prefer_youtube_subs: bool = False
+    use_yt_translate: bool = False
     multi_speaker: bool = False
     transcribe_only: bool = False
     audio_priority: bool = True
@@ -346,6 +348,7 @@ def _run_job(job: Job, req: JobCreateRequest):
             use_coqui_xtts=req.use_coqui_xtts,
             use_edge_tts=req.use_edge_tts,
             prefer_youtube_subs=req.prefer_youtube_subs,
+            use_yt_translate=req.use_yt_translate,
             multi_speaker=req.multi_speaker,
             transcribe_only=req.transcribe_only,
             audio_priority=req.audio_priority,
@@ -353,7 +356,8 @@ def _run_job(job: Job, req: JobCreateRequest):
             encode_preset=req.encode_preset,
         )
 
-        pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job))
+        pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job),
+                           cancel_check=job.cancel_event.is_set)
         pipeline.run()
 
         job.video_title = pipeline.video_title or "Untitled"
@@ -372,29 +376,36 @@ def _run_job(job: Job, req: JobCreateRequest):
 
         job.result_path = out_path
 
-        # Auto-save to titled folder
+        # Stash QA report path before work dir is cleaned up
+        _qa_src = OUTPUTS / job.id / "work" / "qa_report.txt"
+        _qa_report_text = None
+        if _qa_src.exists():
+            try:
+                _qa_report_text = _qa_src.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+        # Auto-save to titled folder (deletes work dir)
         try:
             _save_to_titled_folder(job)
         except Exception as save_err:
             print(f"[WARN] Failed to save to titled folder: {save_err}")
 
+        # Save QA report to output folder
+        if _qa_report_text and job.saved_folder:
+            try:
+                (Path(job.saved_folder) / "qa_report.txt").write_text(_qa_report_text, encoding="utf-8")
+            except Exception:
+                pass
+
         # Generate YouTube description
         try:
             job.description = _generate_youtube_description(job)
-            # Save description file to the titled folder
             if job.saved_folder:
                 desc_path = Path(job.saved_folder) / "description.txt"
                 desc_path.write_text(job.description, encoding="utf-8")
         except Exception as desc_err:
             print(f"[WARN] Failed to generate description: {desc_err}")
-
-        # Save QA report to output folder
-        try:
-            qa_src = OUTPUTS / job.id / "work" / "qa_report.txt"
-            if qa_src.exists() and job.saved_folder:
-                shutil.copy2(str(qa_src), str(Path(job.saved_folder) / "qa_report.txt"))
-        except Exception:
-            pass
 
         job.overall_progress = 1.0
         job.state = "done"
@@ -414,18 +425,13 @@ def _run_job(job: Job, req: JobCreateRequest):
 
     except Exception as e:
         import traceback
-        try:
-            (OUTPUTS / job.id / "error.log").write_text(
-                f"[JOB ERROR] {e}\n{traceback.format_exc()}", encoding="utf-8"
-            )
-        except OSError:
-            pass
-        # Clean up failed job's work directory too
+        err_text = f"[JOB ERROR] {e}\n{traceback.format_exc()}"
+        print(err_text, flush=True)
+        # Clean up work directory but keep error log in saved folder if available
         try:
             job_dir = OUTPUTS / job.id
             if job_dir.exists():
                 shutil.rmtree(job_dir, ignore_errors=True)
-                print(f"[CLEANUP] Deleted failed job work directory {job_dir}")
         except Exception:
             pass
         job.state = "error"
@@ -713,7 +719,12 @@ async def job_events(job_id: str):
 
     async def event_generator():
         last_index = 0
+        sse_start = time.time()
+        max_sse_secs = 14400  # 4h max SSE connection
         while True:
+            if time.time() - sse_start > max_sse_secs:
+                yield {"data": json.dumps({"type": "complete", "state": "error", "error": "SSE timeout"})}
+                return
             # Detect list reset (e.g. resume cleared events) — resync
             if last_index > len(job.events):
                 last_index = 0
@@ -849,7 +860,8 @@ def _run_resume(job: Job):
             multi_speaker=req.multi_speaker if req else False,
         )
 
-        pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job))
+        pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job),
+                           cancel_check=job.cancel_event.is_set)
         pipeline.run_from_srt(translated_srt)
 
         if not out_path.exists():
@@ -995,7 +1007,17 @@ def delete_job(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     if job.state in ("running", "queued"):
-        raise HTTPException(status_code=409, detail="Cannot delete a running job — wait for it to finish or error out")
+        # Signal the pipeline to stop at the next cancel checkpoint
+        job.cancel_event.set()
+        job.state = "error"
+        job.error = "Cancelled by user"
+        job.message = "Cancelled"
+        job.events.append({"type": "complete", "state": "error", "error": "Cancelled by user"})
+        # Clean up work directory
+        job_dir = OUTPUTS / job_id
+        if job_dir.exists():
+            shutil.rmtree(job_dir, ignore_errors=True)
+        return {"status": "cancelled"}
 
     JOBS.pop(job_id, None)
 
@@ -1010,6 +1032,7 @@ def delete_job(job_id: str):
 
 LINKS_FILE = BASE_DIR / "saved_links.json"
 COMPLETED_FILE = BASE_DIR / "completed_urls.json"
+_links_lock = threading.Lock()
 
 
 def _load_links() -> List[Dict]:
@@ -1069,17 +1092,22 @@ def _bg_fetch_title(link_id: str, url: str):
     title = _fetch_yt_title(url)
     if not title:
         return
-    links = _load_links()
-    for link in links:
-        if link["id"] == link_id:
-            link["title"] = title
-            break
-    _save_links(links)
+    with _links_lock:
+        links = _load_links()
+        for link in links:
+            if link["id"] == link_id:
+                link["title"] = title
+                break
+        _save_links(links)
 
 
 @app.get("/api/links")
 def get_links():
-    return _load_links()
+    links = _load_links()
+    completed = set(_load_completed_urls())
+    for link in links:
+        link["completed"] = link["url"] in completed
+    return links
 
 
 class LinkAdd(BaseModel):
@@ -1090,23 +1118,24 @@ class LinkAdd(BaseModel):
 
 @app.post("/api/links")
 def add_link(req: LinkAdd):
-    links = _load_links()
-    # Deduplicate by URL — but update preset if provided
-    for l in links:
-        if l["url"] == req.url:
-            if req.preset:
-                l["preset"] = req.preset
-                _save_links(links)
-            return {"status": "exists", "links": links}
-    link_id = uuid.uuid4().hex[:12]
-    links.append({
-        "id": link_id,
-        "url": req.url,
-        "title": req.title or "",
-        "added_at": time.time(),
-        "preset": req.preset or {},
-    })
-    _save_links(links)
+    with _links_lock:
+        links = _load_links()
+        # Deduplicate by URL — but update preset if provided
+        for l in links:
+            if l["url"] == req.url:
+                if req.preset:
+                    l["preset"] = req.preset
+                    _save_links(links)
+                return {"status": "exists", "links": links}
+        link_id = uuid.uuid4().hex[:12]
+        links.append({
+            "id": link_id,
+            "url": req.url,
+            "title": req.title or "",
+            "added_at": time.time(),
+            "preset": req.preset or {},
+        })
+        _save_links(links)
     # Fetch title in background if not provided
     if not req.title:
         threading.Thread(target=_bg_fetch_title, args=(link_id, req.url), daemon=True).start()
@@ -1119,56 +1148,26 @@ class LinkPresetUpdate(BaseModel):
 
 @app.patch("/api/links/{link_id}")
 def update_link_preset(link_id: str, req: LinkPresetUpdate):
-    links = _load_links()
-    for l in links:
-        if l["id"] == link_id:
-            l["preset"] = req.preset
-            _save_links(links)
-            return {"status": "updated", "links": links}
-    return {"status": "not_found", "links": links}
+    with _links_lock:
+        links = _load_links()
+        for l in links:
+            if l["id"] == link_id:
+                l["preset"] = req.preset
+                _save_links(links)
+                return {"status": "updated", "links": links}
+    raise HTTPException(status_code=404, detail="Link not found")
 
 
 @app.delete("/api/links/{link_id}")
 def delete_link(link_id: str):
-    links = _load_links()
-    links = [l for l in links if l["id"] != link_id]
-    _save_links(links)
+    with _links_lock:
+        links = _load_links()
+        links = [l for l in links if l["id"] != link_id]
+        _save_links(links)
     return {"status": "deleted", "links": links}
-
-
-# ── Auto-resume incomplete links on startup ─────────────────────────────────
-
-def _resume_incomplete_links():
-    """Check saved links vs completed URLs and re-queue incomplete ones."""
-    links = _load_links()
-    completed = set(_load_completed_urls())
-
-    pending = [l for l in links if l["url"] not in completed]
-    if not pending:
-        print("[STARTUP] All saved links already completed.")
-        return
-
-    print(f"[STARTUP] Found {len(pending)} incomplete links, queuing them...")
-    for link in pending:
-        url = link["url"]
-        # Skip if already in the current job queue
-        if any(j.source_url == url and j.state in ("queued", "running") for j in JOBS.values()):
-            print(f"[STARTUP]   Skipping (already queued): {url}")
-            continue
-
-        job_id = uuid.uuid4().hex[:12]
-        preset = link.get("preset", {})
-        req = JobCreateRequest(url=url, **{k: v for k, v in preset.items() if k in JobCreateRequest.model_fields})
-        job = Job(id=job_id, source_url=url, target_language=req.target_language)
-        job.original_req = req
-        JOBS[job_id] = job
-
-        t = threading.Thread(target=_run_job, args=(job, req), daemon=True)
-        t.start()
-        print(f"[STARTUP]   Queued: {url} -> job {job_id}")
 
 
 @app.on_event("startup")
 def _on_startup():
-    """Auto-resume incomplete saved links when the server starts."""
-    threading.Thread(target=_resume_incomplete_links, daemon=True).start()
+    """Server startup hook — placeholder for future startup tasks."""
+    print("[STARTUP] Server ready.", flush=True)

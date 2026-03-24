@@ -219,6 +219,7 @@ class PipelineConfig:
     use_coqui_xtts: bool = False
     use_edge_tts: bool = False
     prefer_youtube_subs: bool = False
+    use_yt_translate: bool = False   # Download YouTube's auto-translated subs in target lang
     multi_speaker: bool = False
     transcribe_only: bool = False
     # Audio priority: let TTS speak at natural pace, video freezes/extends to match
@@ -235,19 +236,27 @@ class Pipeline:
     SAMPLE_RATE = 48000
     N_CHANNELS = 2
 
-    def __init__(self, cfg: PipelineConfig, on_progress: Optional[ProgressCallback] = None):
+    def __init__(self, cfg: PipelineConfig, on_progress: Optional[ProgressCallback] = None,
+                 cancel_check: Optional[Callable[[], bool]] = None):
         self.cfg = cfg
         self._on_progress = on_progress or (lambda *_: None)
+        self._cancel_check = cancel_check or (lambda: False)
         self.segments: List[Dict] = []
         self.video_title: str = ""
         self.qa_score: Optional[float] = None
         self._voice_map = None
         self._whisper_audio = None  # Lightweight 16kHz mono audio for transcription
+        self._has_nvenc: Optional[bool] = None  # Cached NVENC availability
         self.cfg.work_dir.mkdir(parents=True, exist_ok=True)
 
         # Resolve executable paths
         self._ytdlp = self._find_executable("yt-dlp")
         self._ffmpeg = "ffmpeg"  # resolved in _ensure_ffmpeg
+
+    def _check_cancelled(self):
+        """Raise if the job has been cancelled."""
+        if self._cancel_check():
+            raise RuntimeError("Job cancelled by user")
 
     @staticmethod
     def _find_executable(name: str) -> str:
@@ -599,39 +608,114 @@ class Pipeline:
         self._report("transcribe", 0.95,
                      f"Saved {len(saved)} speaker voice references for XTTS voice cloning")
 
+    # ── Caching helpers ─────────────────────────────────────────────────
+    def _save_segments_cache(self, segments: List[Dict], name: str):
+        """Save segments to a JSON cache file in work_dir."""
+        import json
+        cache_path = self.cfg.work_dir / f"_cache_{name}.json"
+        # Only serialize JSON-safe keys (skip Path objects etc.)
+        safe = []
+        for seg in segments:
+            s = {}
+            for k, v in seg.items():
+                if isinstance(v, (str, int, float, bool, type(None))):
+                    s[k] = v
+                elif isinstance(v, list):
+                    s[k] = v
+            safe.append(s)
+        cache_path.write_text(json.dumps(safe, ensure_ascii=False), encoding="utf-8")
+
+    def _load_segments_cache(self, name: str) -> Optional[List[Dict]]:
+        """Load segments from a JSON cache file if it exists."""
+        import json
+        cache_path = self.cfg.work_dir / f"_cache_{name}.json"
+        if not cache_path.exists():
+            return None
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(data, list) and len(data) > 0:
+                return data
+        except Exception:
+            pass
+        return None
+
+    def _find_cached_video(self) -> Optional[Path]:
+        """Check if a video file was already downloaded in work_dir."""
+        for ext in ["mp4", "webm", "mkv"]:
+            p = self.cfg.work_dir / f"source.{ext}"
+            if p.exists() and p.stat().st_size > 0:
+                return p
+        sources = list(self.cfg.work_dir.glob("source.*"))
+        for s in sources:
+            if s.suffix.lower() in (".mp4", ".webm", ".mkv", ".avi", ".mov") and s.stat().st_size > 0:
+                return s
+        return None
+
     # ── Main entry ───────────────────────────────────────────────────────
     def run(self):
-        """Execute the full dubbing pipeline."""
+        """Execute the full dubbing pipeline with step caching for crash recovery."""
         self._ensure_ffmpeg()
 
-        # Step 1: Download / ingest
-        self._report("download", 0.0, "Downloading video...")
-        video_path = self._ingest_source(self.cfg.source)
-        self._report("download", 1.0, f"Downloaded: {video_path.name}")
-
-        # Step 2: Extract audio
-        self._report("extract", 0.0, "Extracting audio...")
-        audio_raw = self._extract_audio(video_path)
-        self._report("extract", 1.0, "Audio extracted")
-
-        # Step 3: Transcribe — try YouTube subs first, fall back to Whisper
-        sub_segments = None
-        if self.cfg.prefer_youtube_subs:
-            self._report("transcribe", 0.0, "Checking for YouTube subtitles...")
-            sub_segments = self._fetch_youtube_subtitles(self.cfg.source)
-
-        if sub_segments:
-            self.segments = sub_segments
-            self._report("transcribe", 1.0,
-                         f"Using YouTube subtitles ({len(sub_segments)} segments, skipped Whisper)")
+        # Step 1: Download / ingest — cache: source.mp4 exists
+        video_path = self._find_cached_video()
+        if video_path:
+            self._report("download", 1.0, f"[cached] Using existing: {video_path.name}")
+            # Recover title if possible
+            if not self.video_title:
+                self.video_title = video_path.stem
         else:
+            self._report("download", 0.0, "Downloading video...")
+            video_path = self._ingest_source(self.cfg.source)
+            self._report("download", 1.0, f"Downloaded: {video_path.name}")
+
+        self._check_cancelled()
+
+        # Step 2: Extract audio — cache: audio_raw.wav exists
+        audio_raw = self.cfg.work_dir / "audio_raw.wav"
+        wav_16k = self.cfg.work_dir / "audio_16k.wav"
+        if audio_raw.exists() and audio_raw.stat().st_size > 0:
+            self._report("extract", 1.0, "[cached] Audio already extracted")
+            if wav_16k.exists():
+                self._whisper_audio = wav_16k
+        else:
+            self._report("extract", 0.0, "Extracting audio...")
+            audio_raw = self._extract_audio(video_path)
+            self._report("extract", 1.0, "Audio extracted")
+
+        self._check_cancelled()
+
+        # Step 3: Transcribe — cache: _cache_transcribe.json exists
+        sub_segments = None
+        cached_segs = self._load_segments_cache("transcribe")
+        if cached_segs:
+            self.segments = cached_segs
+            text_segments = [s for s in self.segments if s.get("text", "").strip()]
+            self._report("transcribe", 1.0,
+                         f"[cached] Loaded {len(text_segments)} transcribed segments")
+        else:
+            sub_segments = None
             if self.cfg.prefer_youtube_subs:
-                self._report("transcribe", 0.05, "No subtitles found, using Whisper...")
-            self._report("transcribe", 0.1, "Loading ASR model...")
-            # Use 16kHz mono audio for transcription (smaller, faster upload for Groq API)
-            whisper_audio = getattr(self, '_whisper_audio', audio_raw)
-            self.segments = self._transcribe(whisper_audio)
-            self._report("transcribe", 1.0, f"Transcribed {len(self.segments)} segments")
+                self._report("transcribe", 0.0, "Checking for YouTube subtitles...")
+                sub_segments = self._fetch_youtube_subtitles(self.cfg.source)
+
+            if sub_segments:
+                self.segments = sub_segments
+                self._report("transcribe", 1.0,
+                             f"Using YouTube subtitles ({len(sub_segments)} segments, skipped Whisper)")
+            else:
+                if self.cfg.prefer_youtube_subs:
+                    self._report("transcribe", 0.05, "No subtitles found, using Whisper...")
+                self._report("transcribe", 0.1, "Loading ASR model...")
+                whisper_audio = self._whisper_audio or audio_raw
+                self.segments = self._transcribe(whisper_audio)
+                self._report("transcribe", 1.0, f"Transcribed {len(self.segments)} segments")
+
+            text_segments = [s for s in self.segments if s.get("text", "").strip()]
+            if not text_segments:
+                raise RuntimeError("No speech detected in the video")
+
+            # Cache transcription for crash recovery
+            self._save_segments_cache(text_segments, "transcribe")
 
         text_segments = [s for s in self.segments if s.get("text", "").strip()]
         if not text_segments:
@@ -655,7 +739,6 @@ class Pipeline:
             if speaker_genders and speaker_ranges:
                 self._assign_speaker_to_segments(text_segments, speaker_ranges)
                 self._voice_map = self._assign_voices_to_speakers(speaker_genders)
-                # Save per-speaker voice refs for Coqui XTTS voice cloning
                 if self.cfg.use_coqui_xtts:
                     self._save_speaker_refs(audio_raw, text_segments)
                 self._report("transcribe", 0.99,
@@ -669,21 +752,51 @@ class Pipeline:
             _write_srt(text_segments, source_srt, text_key="text",
                        include_speaker=has_speakers)
 
-            # Save per-speaker voice reference clips for Coqui XTTS voice cloning
             if has_speakers:
                 self._save_speaker_refs(audio_raw, text_segments)
 
             speaker_note = f" ({len(set(s.get('speaker_id','') for s in text_segments if s.get('speaker_id')))} speakers detected)" if has_speakers else ""
             self._report("transcribe", 1.0,
                          f"Transcription complete — {len(text_segments)} segments{speaker_note}. Download SRT to translate.")
-            return  # Pipeline pauses here; user translates externally
+            return
 
-        # Step 4: Translate each segment (preserving timestamps for scene sync)
-        target_name = LANGUAGE_NAMES.get(self.cfg.target_language, self.cfg.target_language)
-        self._report("translate", 0.0, f"Translating segments to {target_name}...")
-        self._translate_segments(text_segments)
-        self.segments = text_segments
-        self._report("translate", 1.0, "Translation complete")
+        self._check_cancelled()
+
+        # Step 4: Translate — cache: _cache_translate.json exists
+        yt_translated = None
+        if self.cfg.use_yt_translate and re.match(r"^https?://", self.cfg.source):
+            self._report("translate", 0.0, "Fetching YouTube auto-translated subtitles...")
+            yt_translated = self._fetch_youtube_translated_subs(self.cfg.source)
+            if yt_translated:
+                self.segments = yt_translated
+                text_segments = [s for s in self.segments if s.get("text_translated", "").strip()]
+                self._report("translate", 1.0,
+                             f"Using YouTube translated subs — {len(text_segments)} segments (skipped Whisper translation)")
+                self._save_segments_cache(text_segments, "translate")
+            else:
+                self._report("translate", 0.1, "No YouTube translated subs found, using normal translation...")
+
+        if not yt_translated:
+            cached_translated = self._load_segments_cache("translate")
+            if cached_translated:
+                # Verify the cached translation matches current target language
+                has_translation = any(s.get("text_translated") for s in cached_translated)
+                if has_translation:
+                    self.segments = cached_translated
+                    text_segments = [s for s in self.segments if s.get("text", "").strip()]
+                    self._report("translate", 1.0,
+                                 f"[cached] Loaded {len(text_segments)} translated segments")
+                else:
+                    cached_translated = None
+
+            if not cached_translated:
+                target_name = LANGUAGE_NAMES.get(self.cfg.target_language, self.cfg.target_language)
+                self._report("translate", 0.0, f"Translating segments to {target_name}...")
+                self._translate_segments(text_segments)
+                self.segments = text_segments
+                self._report("translate", 1.0, "Translation complete")
+                # Cache translation for crash recovery
+                self._save_segments_cache(text_segments, "translate")
 
         # ── QA Check: Compare our translation against reference English subs ──
         if getattr(self, '_ref_english_subs', None):
@@ -702,10 +815,11 @@ class Pipeline:
                 self._report("translate", 0.0, "QA failed — re-translating from English reference subs...")
                 for ref_seg in self._ref_english_subs:
                     ref_seg["text"] = ref_seg.get("text", "")
-                self._translate_segments(self._ref_english_subs)
-                self.segments = self._ref_english_subs
-                text_segments = self._ref_english_subs
-                # Re-run QA
+                ref_copy = [dict(s) for s in self._ref_english_subs]
+                self._translate_segments(ref_copy)
+                self.segments = ref_copy
+                text_segments = ref_copy
+                # Re-run QA against original English subs
                 qa2 = self._qa_post_translation(text_segments, self._ref_english_subs)
                 self.qa_score = qa2["score"]
                 qa_path.write_text(qa2["report"], encoding="utf-8")
@@ -716,12 +830,16 @@ class Pipeline:
         srt_translated = self.cfg.work_dir / f"transcript_{self.cfg.target_language}.srt"
         write_srt(self.segments, srt_translated, text_key="text_translated")
 
+        self._check_cancelled()
+
         # Step 5: Generate TTS (Edge-TTS already includes 1.25x speedup in one pass)
         self._report("synthesize", 0.0,
                      f"Generating speech ({self.cfg.tts_voice})...")
         tts_data = self._generate_tts_natural(text_segments)
         if not tts_data:
             raise RuntimeError("TTS synthesis produced no audio segments — check TTS engine settings")
+
+        self._check_cancelled()
 
         # Speed up segments that weren't already sped (Edge-TTS does it in MP3→WAV pass)
         needs_speedup = [(i, t) for i, t in enumerate(tts_data) if not t.get("_already_sped")]
@@ -752,6 +870,8 @@ class Pipeline:
         self._report("assemble", 0.0, "Building dubbed output...")
         self.cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
         video_duration = self._get_duration(video_path)
+        if video_duration <= 0:
+            raise RuntimeError(f"Could not determine video duration for {video_path.name}")
 
         if self.cfg.audio_priority:
             self._report("assemble", 0.05, "Fast assembly: audio priority mode (stream copy)...")
@@ -872,6 +992,8 @@ class Pipeline:
         self._report("assemble", 0.0, "Building dubbed output...")
         self.cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
         video_duration = self._get_duration(video_path)
+        if video_duration <= 0:
+            raise RuntimeError(f"Could not determine video duration for {video_path.name}")
 
         if self.cfg.audio_priority:
             self._report("assemble", 0.05, "Fast assembly: audio priority mode (stream copy)...")
@@ -909,6 +1031,33 @@ class Pipeline:
                 "FFmpeg not found! Install: winget install Gyan.FFmpeg"
             )
         self._ffmpeg = resolved
+
+    def _check_nvenc(self) -> bool:
+        """Check if NVIDIA NVENC hardware encoder is available."""
+        if self._has_nvenc is not None:
+            return self._has_nvenc
+        try:
+            r = subprocess.run(
+                [self._ffmpeg, "-hide_banner", "-encoders"],
+                capture_output=True, text=True, timeout=10,
+            )
+            self._has_nvenc = "h264_nvenc" in (r.stdout or "")
+        except Exception:
+            self._has_nvenc = False
+        if self._has_nvenc:
+            print("[NVENC] GPU encoding available — using h264_nvenc", flush=True)
+        return self._has_nvenc
+
+    def _video_encode_args(self, crf: str = "20", force_cpu: bool = False) -> list:
+        """Return FFmpeg video encoder arguments — NVENC if available, else libx264.
+
+        force_cpu: use libx264 even if NVENC is available (for short clips where
+        NVENC session overhead > encoding time, and rapid session creation crashes).
+        """
+        if not force_cpu and self._check_nvenc():
+            # NVENC uses -qp (constant QP) instead of -crf; qp≈crf for visual quality
+            return ["-c:v", "h264_nvenc", "-preset", "p4", "-qp", crf]
+        return ["-c:v", "libx264", "-preset", self.cfg.encode_preset, "-crf", crf]
 
     # ── Step 1: Ingest ───────────────────────────────────────────────────
     def _find_cookies_file(self) -> Optional[str]:
@@ -950,7 +1099,7 @@ class Pipeline:
                     self._ytdlp, "--print", "%(title)s",
                 ] + cookies_args + js_args + [src]
                 print(f"[YTDLP] title cmd: {title_cmd}", flush=True)
-                title_result = subprocess.run(title_cmd, capture_output=True, text=True, timeout=60)
+                title_result = subprocess.run(title_cmd, capture_output=True, text=True, timeout=60, encoding="utf-8", errors="replace")
                 print(f"[YTDLP] title rc={title_result.returncode} stdout={repr((title_result.stdout or '')[:200])}", flush=True)
                 if title_result.returncode != 0:
                     print(f"[YTDLP] title stderr: {(title_result.stderr or '')[:300]}", flush=True)
@@ -1145,7 +1294,11 @@ class Pipeline:
         if not re.match(r"^https?://", url):
             return None  # Local file, no YouTube subs
 
-        lang = self.cfg.source_language if self.cfg.source_language != "auto" else "en"
+        # Try specific source language first; if auto, try common languages
+        if self.cfg.source_language != "auto":
+            langs_to_try = [self.cfg.source_language]
+        else:
+            langs_to_try = ["en", "zh", "zh-Hans", "ja", "ko", "es", "hi", "ru", "fr", "de", "pt"]
         cookies_args = self._get_cookies_args()
 
         sub_dir = self.cfg.work_dir / "subs"
@@ -1153,7 +1306,65 @@ class Pipeline:
         out_tpl = str(sub_dir / "sub.%(ext)s")
 
         for write_flag in ["--write-sub", "--write-auto-sub"]:
-            # Clean previous attempt
+            for lang in langs_to_try:
+                # Clean previous attempt
+                for f in sub_dir.glob("*"):
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+
+                cmd = [
+                    self._ytdlp,
+                    write_flag,
+                    "--sub-lang", lang,
+                    "--sub-format", "vtt/srt/best",
+                    "--skip-download",
+                    "-o", out_tpl,
+                ] + cookies_args + [url]
+
+                try:
+                    subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                except Exception:
+                    continue
+
+                # Look for downloaded subtitle files
+                for vtt_file in sub_dir.glob("*.vtt"):
+                    segments = self._parse_vtt(vtt_file)
+                    if segments:
+                        return segments
+                for srt_file in sub_dir.glob("*.srt"):
+                    segments = self._parse_srt_file(srt_file)
+                    if segments:
+                        return segments
+
+        return None
+
+    def _fetch_youtube_translated_subs(self, url: str) -> Optional[List[Dict]]:
+        """Download YouTube's auto-translated subtitles in the target language.
+
+        YouTube can translate auto-captions to any language on-the-fly.
+        yt-dlp format: --sub-lang {target}-{source} for translated subs.
+        This skips both Whisper AND our translation step.
+        """
+        if not re.match(r"^https?://", url):
+            return None
+
+        cookies_args = self._get_cookies_args()
+        sub_dir = self.cfg.work_dir / "yt_translated"
+        sub_dir.mkdir(exist_ok=True)
+
+        target = self.cfg.target_language
+        # YouTube uses codes like "hi", "zh-Hans", "en" etc.
+        # Auto-translated subs use format: target-source (e.g. "hi-en" = Hindi from English)
+        # We try multiple source languages since we may not know the original
+        source_langs = ["en", "zh-Hans", "zh-Hant", "ja", "ko", "es", "ru", "fr", "de", "pt"]
+        if self.cfg.source_language != "auto":
+            source_langs = [self.cfg.source_language] + source_langs
+
+        for src_lang in source_langs:
+            sub_lang = f"{target}-{src_lang}" if target != src_lang else target
+
             for f in sub_dir.glob("*"):
                 try:
                     f.unlink()
@@ -1162,26 +1373,36 @@ class Pipeline:
 
             cmd = [
                 self._ytdlp,
-                write_flag,
-                "--sub-lang", lang,
+                "--write-auto-sub",
+                "--sub-lang", sub_lang,
                 "--sub-format", "vtt/srt/best",
                 "--skip-download",
-                "-o", out_tpl,
+                "-o", str(sub_dir / "ytsub.%(ext)s"),
             ] + cookies_args + [url]
 
             try:
-                subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                                   encoding="utf-8", errors="replace")
             except Exception:
                 continue
 
-            # Look for downloaded subtitle files
+            # Check for downloaded files
             for vtt_file in sub_dir.glob("*.vtt"):
                 segments = self._parse_vtt(vtt_file)
                 if segments:
+                    self._report("translate", 0.5,
+                                 f"Got YouTube auto-translated {target} subs from {src_lang} ({len(segments)} segments)")
+                    # Mark segments as already translated
+                    for seg in segments:
+                        seg["text_translated"] = seg.get("text", "")
                     return segments
             for srt_file in sub_dir.glob("*.srt"):
                 segments = self._parse_srt_file(srt_file)
                 if segments:
+                    self._report("translate", 0.5,
+                                 f"Got YouTube auto-translated {target} subs from {src_lang} ({len(segments)} segments)")
+                    for seg in segments:
+                        seg["text_translated"] = seg.get("text", "")
                     return segments
 
         return None
@@ -1774,8 +1995,10 @@ class Pipeline:
                                      f"Groq rate limited, retrying in {wait}s...")
                         time.sleep(wait)
                     else:
-                        self._report("translate", 0.2, f"Groq failed: {e}, falling back to Google Translate...")
-                        return self._translate_with_google(full_text)
+                        self._report("translate", 0.2, f"Groq failed on chunk {i+1}: {e}, falling back to Google for this chunk...")
+                        fallback = self._translate_with_google(chunk)
+                        translated_parts.append(fallback)
+                        break
 
             self._report("translate", 0.2 + 0.8 * ((i + 1) / len(chunks)),
                          f"Translated chunk {i + 1}/{len(chunks)} (Groq)")
@@ -1813,11 +2036,8 @@ class Pipeline:
                 force_model = ""
 
         if not force_model:
-            # Prefer custom hinglish-translator for Hindi, else pick best available
-            preferred = (
-                ["hinglish-translator"] if self.cfg.target_language in ("hi", "hi-IN")
-                else []
-            ) + ["qwen2.5:14b", "qwen2.5:32b", "llama3.1:8b", "llama3:8b", "gemma2:9b", "mistral:7b"]
+            # Prefer hindi-dubbing (optimized qwen2.5:14b), then raw qwen2.5, then others
+            preferred = ["hindi-dubbing", "qwen2.5:14b", "qwen2.5:32b", "llama3.1:8b", "llama3:8b", "gemma2:9b", "mistral:7b"]
             model = None
             for pref in preferred:
                 for m in models:
@@ -2148,7 +2368,7 @@ class Pipeline:
             if not success:
                 self._report("translate", 0.1, "Gemini failed, using Google Translate for batch...")
                 for seg in batch:
-                    seg["text_translated"] = self._translate_single_google(seg["text"])
+                    seg["text_translated"] = self._translate_single_fallback(seg["text"])
 
             self._report("translate", 0.1 + 0.9 * ((batch_idx + 1) / total_batches),
                          f"Translated batch {batch_idx + 1}/{total_batches}")
@@ -2199,7 +2419,7 @@ class Pipeline:
             if not success:
                 self._report("translate", 0.1, "Groq failed, using Google Translate for batch...")
                 for seg in batch:
-                    seg["text_translated"] = self._translate_single_google(seg["text"])
+                    seg["text_translated"] = self._translate_single_fallback(seg["text"])
 
             self._report("translate", 0.1 + 0.9 * ((batch_idx + 1) / total_batches),
                          f"Translated batch {batch_idx + 1}/{total_batches} (Groq)")
@@ -2259,7 +2479,7 @@ class Pipeline:
             else:
                 self._report("translate", 0.1, "SambaNova failed, using Google Translate for batch...")
                 for seg in batch:
-                    seg["text_translated"] = self._translate_single_google(seg["text"])
+                    seg["text_translated"] = self._translate_single_fallback(seg["text"])
 
             self._report("translate", 0.1 + 0.9 * ((batch_idx + 1) / total_batches),
                          f"Translated batch {batch_idx + 1}/{total_batches} (SambaNova)")
@@ -2303,9 +2523,9 @@ class Pipeline:
                         seg["text_translated"] = translations[i] if translations[i] else seg["text"]
                 else:
                     self._report("translate", 0.1,
-                                 f"{engine_name} failed batch {batch_idx+1}, falling back to Google...")
+                                 f"{engine_name} failed batch {batch_idx+1}, falling back to Ollama/Google...")
                     for seg in batch:
-                        seg["text_translated"] = self._translate_single_google(seg["text"])
+                        seg["text_translated"] = self._translate_single_fallback(seg["text"])
 
                 completed += 1
                 self._report("translate", 0.1 + 0.9 * (completed / total_batches),
@@ -2378,7 +2598,7 @@ class Pipeline:
             except Exception as e:
                 self._report("translate", 0.1, f"Ollama failed for batch: {e}, using Google Translate...")
                 for seg in batch:
-                    seg["text_translated"] = self._translate_single_google(seg["text"])
+                    seg["text_translated"] = self._translate_single_fallback(seg["text"])
 
             self._report("translate", 0.1 + 0.9 * ((batch_idx + 1) / total_batches),
                          f"Translated batch {batch_idx + 1}/{total_batches} (Ollama: {model})")
@@ -2441,7 +2661,7 @@ class Pipeline:
                     self._translate_segments_gemini(batch, gemini_key)
                 else:
                     for seg in batch:
-                        seg["text_translated"] = self._translate_single_google(seg["text"])
+                        seg["text_translated"] = self._translate_single_fallback(seg["text"])
 
             self._report("translate", 0.1 + 0.9 * ((batch_idx + 1) / total_batches),
                          f"Translated batch {batch_idx + 1}/{total_batches} (GPT-4o)")
@@ -2449,9 +2669,47 @@ class Pipeline:
     def _translate_segments_google(self, segments):
         """Fallback: translate each segment using Google Translate."""
         for i, seg in enumerate(segments):
-            seg["text_translated"] = self._translate_single_google(seg["text"])
+            seg["text_translated"] = self._translate_single_fallback(seg["text"])
             self._report("translate", 0.1 + 0.9 * ((i + 1) / len(segments)),
                          f"Translated {i + 1}/{len(segments)} segments")
+
+    def _translate_single_fallback(self, text: str) -> str:
+        """Smart fallback: try Ollama (GPU) first, then Google Translate."""
+        if self._ollama_available():
+            try:
+                import requests as _requests
+                target_name = LANGUAGE_NAMES.get(self.cfg.target_language, self.cfg.target_language)
+                # Pick best Ollama model
+                resp = _requests.get("http://localhost:11434/api/tags", timeout=2)
+                models = [m["name"] for m in resp.json().get("models", [])]
+                preferred = ["hindi-dubbing", "qwen2.5:14b", "qwen2.5:32b", "llama3.1:8b", "gemma2:9b", "mistral:7b"]
+                model = None
+                for pref in preferred:
+                    for m in models:
+                        if pref.split(":")[0] in m:
+                            model = m
+                            break
+                    if model:
+                        break
+                if not model and models:
+                    model = models[0]
+                if model:
+                    prompt = (
+                        f"Translate the following text to {target_name}. "
+                        f"Use natural, conversational {target_name} — not literal translation. "
+                        f"Output ONLY the translation, nothing else.\n\n{text}"
+                    )
+                    resp = _requests.post(
+                        "http://localhost:11434/api/generate",
+                        json={"model": model, "prompt": prompt, "stream": False},
+                        timeout=60,
+                    )
+                    result = resp.json().get("response", "").strip()
+                    if result:
+                        return result
+            except Exception:
+                pass
+        return self._translate_single_google(text)
 
     def _translate_single_google(self, text: str) -> str:
         """Translate a single text with Google Translate."""
@@ -2476,8 +2734,7 @@ class Pipeline:
             match = re.match(r'\s*\d+[\.\)]\s*(?:\[[^\]]*\]\s*)?(.*)', line)
             if match:
                 trans = match.group(1).strip()
-                if trans:
-                    translations.append(trans)
+                translations.append(trans)
         # Pad with empty strings if Gemini returned fewer lines
         while len(translations) < expected_count:
             translations.append("")
@@ -2723,7 +2980,8 @@ class Pipeline:
         # Build FFmpeg command with adelay filters to place each segment
         inputs = []
         filter_parts = []
-        for i, seg in enumerate(tts_data):
+        valid_idx = 0
+        for seg in tts_data:
             wav_path = seg["wav"]
             if not Path(wav_path).exists():
                 continue
@@ -2731,8 +2989,9 @@ class Pipeline:
             inputs.extend(["-i", str(wav_path)])
             idx = len(inputs) // 2 - 1  # input index
             filter_parts.append(
-                f"[{idx}:a]adelay={delay_ms}|{delay_ms},apad[d{i}]"
+                f"[{idx}:a]adelay={delay_ms}|{delay_ms},apad[d{valid_idx}]"
             )
+            valid_idx += 1
 
         if not filter_parts:
             # No valid segments — generate silence
@@ -2878,7 +3137,7 @@ class Pipeline:
                      "-ss", f"{vs:.3f}", "-i", str(video_path),
                      "-t", f"{dur:.3f}",
                      "-an",
-                     "-c:v", "libx264", "-preset", self.cfg.encode_preset, "-crf", "20",
+                     *self._video_encode_args(force_cpu=True),
                      str(clip)],
                     check=True, capture_output=True,
                 )
@@ -2897,7 +3156,7 @@ class Pipeline:
                              "-ss", f"{vs:.3f}", "-i", str(video_path),
                              "-t", f"{dur:.3f}",
                              "-an",
-                             "-c:v", "libx264", "-preset", self.cfg.encode_preset, "-crf", "20",
+                             *self._video_encode_args(force_cpu=True),
                              str(clip)],
                             check=True, capture_output=True,
                         )
@@ -2908,7 +3167,7 @@ class Pipeline:
                              "-t", f"{dur:.3f}",
                              "-filter:v", f"setpts={pts_factor:.6f}*PTS",
                              "-an",
-                             "-c:v", "libx264", "-preset", self.cfg.encode_preset, "-crf", "20",
+                             *self._video_encode_args(force_cpu=True),
                              str(clip)],
                             check=True, capture_output=True,
                         )
@@ -2927,7 +3186,7 @@ class Pipeline:
                          "-t", f"{dur:.3f}",
                          "-filter:v", f"setpts={self.VIDEO_SLOW_MAX:.6f}*PTS",
                          "-an",
-                         "-c:v", "libx264", "-preset", self.cfg.encode_preset, "-crf", "20",
+                         *self._video_encode_args(force_cpu=True),
                          str(slowed_clip)],
                         check=True, capture_output=True,
                     )
@@ -2973,7 +3232,7 @@ class Pipeline:
                              "-loop", "1", "-i", str(last_frame),
                              "-t", f"{freeze_dur:.3f}",
                              "-vf", "fps=30",
-                             "-c:v", "libx264", "-preset", self.cfg.encode_preset, "-crf", "20",
+                             *self._video_encode_args(force_cpu=True),
                              "-pix_fmt", "yuv420p",
                              str(freeze_clip)],
                             check=True, capture_output=True,
@@ -2988,7 +3247,7 @@ class Pipeline:
                             [self._ffmpeg, "-y",
                              "-f", "concat", "-safe", "0",
                              "-i", str(concat_list),
-                             "-c:v", "libx264", "-preset", self.cfg.encode_preset, "-crf", "20",
+                             *self._video_encode_args(force_cpu=True),
                              str(clip)],
                             check=True, capture_output=True,
                         )
@@ -3628,7 +3887,8 @@ class Pipeline:
         import edge_tts
         default_voice = self.cfg.tts_voice
         rate = self.cfg.tts_rate
-        concurrency = 80  # Process 80 segments simultaneously
+        concurrency = 120  # Process 120 segments simultaneously
+        _tts_failures = [0]  # mutable counter for async closure
 
         async def generate_one(i, seg, semaphore):
             text = seg.get("text_translated", seg.get("text", "")).strip()
@@ -3639,12 +3899,19 @@ class Pipeline:
                 seg_voice = voice_map.get(seg["speaker_id"], default_voice)
             mp3 = work_dir / f"tts_{i:04d}.mp3"
             async with semaphore:
-                try:
-                    comm = edge_tts.Communicate(text, seg_voice, rate=rate)
-                    await comm.save(str(mp3))
-                    seg["_tts_mp3"] = mp3
-                except Exception:
-                    pass
+                for attempt in range(3):
+                    try:
+                        comm = edge_tts.Communicate(text, seg_voice, rate=rate)
+                        await comm.save(str(mp3))
+                        seg["_tts_mp3"] = mp3
+                        return
+                    except Exception as e:
+                        if attempt < 2:
+                            await asyncio.sleep(1 * (attempt + 1))
+                        else:
+                            _tts_failures[0] += 1
+                            if _tts_failures[0] <= 5:
+                                print(f"[TTS] Segment {i} failed after 3 retries: {e}", flush=True)
 
         async def generate_all():
             semaphore = asyncio.Semaphore(concurrency)
@@ -3853,7 +4120,7 @@ class Pipeline:
                      "-ss", f"{vs:.3f}", "-i", str(video_path),
                      "-t", f"{dur:.3f}",
                      "-an",
-                     "-c:v", "libx264", "-preset", self.cfg.encode_preset, "-crf", "20",
+                     *self._video_encode_args(force_cpu=True),
                      str(clip)],
                     check=True, capture_output=True,
                 )
@@ -3866,7 +4133,7 @@ class Pipeline:
                      "-t", f"{dur:.3f}",
                      "-filter:v", f"setpts={pts_factor:.6f}*PTS",
                      "-an",
-                     "-c:v", "libx264", "-preset", self.cfg.encode_preset, "-crf", "20",
+                     *self._video_encode_args(force_cpu=True),
                      str(clip)],
                     check=True, capture_output=True,
                 )
@@ -4031,7 +4298,7 @@ class Pipeline:
                 self._ffmpeg, "-y", "-i", str(video_path),
                 "-filter:v", f"setpts={pts_factor:.6f}*PTS",
                 "-an",  # Drop original audio (we'll add dubbed audio)
-                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                *self._video_encode_args("18"),
                 str(adjusted),
             ],
             check=True, capture_output=True,
