@@ -40,6 +40,7 @@ from sse_starlette.sse import EventSourceResponse
 from pipeline import Pipeline, PipelineConfig, list_voices, DEFAULT_VOICES
 from metrics import get_metrics
 from jobstore import JobStore
+from supabase_store import SupabaseStore, DualStore
 
 # ── Hinglish AI Training Hook ────────────────────────────────────────────────
 HINGLISH_TRAINER_URL = os.environ.get("HINGLISH_TRAINER_URL", "http://localhost:8100")
@@ -197,9 +198,11 @@ _preferred_save = Path("D:/Shirshendu sasmal/youtube dubbed")
 SAVED_DIR = _preferred_save if _preferred_save.exists() else BASE_DIR / "dubbed_outputs"
 SAVED_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── SQLite job persistence ────────────────────────────────────────────────────
-# Survives server restarts: jobs reload from DB on startup.
-_store = JobStore(BASE_DIR / "jobs.db")
+# ── Job persistence: SQLite (primary) + Supabase (secondary) ─────────────────
+# SQLite is always the source of truth (fast, local, no network dependency).
+# Supabase receives every write in a background thread — never blocks pipeline.
+# Set SUPABASE_URL + SUPABASE_SERVICE_KEY in .env to enable Supabase sync.
+_store = DualStore(JobStore(BASE_DIR / "jobs.db"), SupabaseStore())
 _store.load_all(JOBS)
 
 # ── App ──────────────────────────────────────────────────────────────────────
