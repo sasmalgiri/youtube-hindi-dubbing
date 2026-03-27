@@ -54,6 +54,7 @@ const PRESET_LABELS: { key: keyof LinkPreset; label: string; type: 'select' | 't
     { key: 'use_yt_translate', label: 'YT Translate', type: 'toggle' },
     { key: 'audio_priority', label: 'Audio Priority', type: 'toggle' },
     { key: 'enable_manual_review', label: 'Manual Review', type: 'toggle' },
+    { key: 'use_whisperx', label: 'WhisperX Align', type: 'toggle' },
 ];
 
 function PresetSummary({ preset }: { preset?: LinkPreset }) {
@@ -68,6 +69,7 @@ function PresetSummary({ preset }: { preset?: LinkPreset }) {
     if (preset.mix_original) parts.push('BG');
     if (preset.prefer_youtube_subs) parts.push('YTSub');
     if (preset.use_yt_translate) parts.push('YT-TR');
+    if (preset.use_whisperx) parts.push('WhisperX');
     return <span className="text-primary-light">{parts.join(' · ') || 'Default'}</span>;
 }
 

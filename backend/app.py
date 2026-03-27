@@ -433,6 +433,9 @@ def _make_progress_callback(job: Job):
             "overall": round(job.overall_progress, 3),
             "message": message,
         })
+        # Cap events list to prevent unbounded memory growth
+        if len(job.events) > 500:
+            job.events = job.events[-500:]
     return callback
 
 
@@ -763,6 +766,8 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
                 "overall": round(job.overall_progress, 3),
                 "message": f"[{_label}] {message}",
             })
+            if len(job.events) > 500:
+                job.events = job.events[-500:]
 
         _part_callback("transcribe", 0.0, f"Starting {part_label}...")
 
@@ -790,6 +795,7 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             encode_preset=req.encode_preset,
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
+            use_whisperx=req.use_whisperx,
         )
 
         pipeline = Pipeline(cfg, on_progress=_part_callback,
@@ -869,6 +875,7 @@ def _queue_chain_next(parent_job: Job):
         encode_preset=_orig.encode_preset if _orig else "veryfast",
         fast_assemble=_orig.fast_assemble if _orig else True,
         enable_manual_review=_orig.enable_manual_review if _orig else True,
+        use_whisperx=_orig.use_whisperx if _orig else False,
     )
 
     job = Job(
@@ -936,6 +943,9 @@ def list_jobs():
             "saved_folder": j.saved_folder,
             "saved_video": j.saved_video,
             "description": j.description,
+            "qa_score": j.qa_score,
+            "chain_languages": j.chain_languages,
+            "chain_parent_id": j.chain_parent_id,
         }
         for j in jobs
     ]
@@ -1033,6 +1043,7 @@ async def create_job_upload(
     split_duration: int = Form(0),
     fast_assemble: str = Form("true"),
     enable_manual_review: str = Form("true"),
+    use_whisperx: str = Form("false"),
     voice: str = Form("hi-IN-SwaraNeural"),
 ):
     """Create a dubbing job from an uploaded video file."""
@@ -1083,6 +1094,7 @@ async def create_job_upload(
             split_duration=split_duration,
             fast_assemble=_bool(fast_assemble),
             enable_manual_review=_bool(enable_manual_review),
+            use_whisperx=_bool(use_whisperx),
         )
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -1240,6 +1252,7 @@ async def create_job_with_srt(
     split_duration: int = Form(0),
     fast_assemble: str = Form("true"),
     enable_manual_review: str = Form("true"),
+    use_whisperx: str = Form("false"),
     voice: str = Form("hi-IN-SwaraNeural"),
 ):
     """Create a dubbing job from a video (URL or file) + pre-translated SRT file.
@@ -1305,6 +1318,7 @@ async def create_job_with_srt(
             split_duration=split_duration,
             fast_assemble=_bool(fast_assemble),
             enable_manual_review=_bool(enable_manual_review),
+            use_whisperx=_bool(use_whisperx),
         )
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -1375,6 +1389,8 @@ def get_job(job_id: str):
         "saved_video": job.saved_video,
         "description": job.description,
         "qa_score": job.qa_score,
+        "chain_languages": job.chain_languages,
+        "chain_parent_id": job.chain_parent_id,
     }
 
 
@@ -1766,10 +1782,11 @@ def _load_completed_urls() -> List[str]:
 
 def _mark_url_completed(url: str):
     """Add a URL to the completed list (persisted to disk)."""
-    urls = _load_completed_urls()
-    if url not in urls:
-        urls.append(url)
-        COMPLETED_FILE.write_text(json.dumps(urls, indent=2, ensure_ascii=False), encoding="utf-8")
+    with _links_lock:
+        urls = _load_completed_urls()
+        if url not in urls:
+            urls.append(url)
+            COMPLETED_FILE.write_text(json.dumps(urls, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _fetch_yt_title(url: str) -> str:

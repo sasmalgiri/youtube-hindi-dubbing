@@ -37,6 +37,7 @@ export default function HomePage() {
         fast_assemble: false,
         dub_chain: [],
         enable_manual_review: true,
+        use_whisperx: false,
     });
     const [currentUrl, setCurrentUrl] = useState('');
     const [submitting, setSubmitting] = useState(false);

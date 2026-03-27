@@ -25,6 +25,7 @@ export interface DubbingSettings {
     fast_assemble: boolean;
     dub_chain: string[];
     enable_manual_review: boolean;
+    use_whisperx: boolean;
 }
 
 interface SettingsPanelProps {
@@ -559,6 +560,26 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                                     <div className={`
                                         w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
                                         ${settings.enable_manual_review ? 'translate-x-6' : 'translate-x-1'}
+                                    `} />
+                                </button>
+                            </div>
+
+                            {/* WhisperX Word Alignment */}
+                            <div className="flex items-center justify-between">
+                                <div>
+                                    <p className="text-sm text-text-primary">WhisperX Alignment</p>
+                                    <p className="text-xs text-text-muted">Force word-level timestamp alignment after transcription for tighter lip-sync (requires whisperx installed)</p>
+                                </div>
+                                <button
+                                    type="button" title="Toggle WhisperX Alignment" onClick={() => update({ use_whisperx: !settings.use_whisperx })}
+                                    className={`
+                                        w-11 h-6 rounded-full transition-colors relative
+                                        ${settings.use_whisperx ? 'bg-primary' : 'bg-white/10'}
+                                    `}
+                                >
+                                    <div className={`
+                                        w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                        ${settings.use_whisperx ? 'translate-x-6' : 'translate-x-1'}
                                     `} />
                                 </button>
                             </div>
