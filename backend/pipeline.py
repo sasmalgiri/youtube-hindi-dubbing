@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
+import array as _array
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -3439,8 +3440,16 @@ class Pipeline:
 
             end_byte = min(start_byte + len(raw), len(timeline))
             copy_len = end_byte - start_byte
-            if copy_len > 0:
-                timeline[start_byte:end_byte] = raw[:copy_len]
+            if copy_len <= 0:
+                continue
+            # Mix samples instead of overwriting — prevents audio dropout on overlapping segments.
+            # int16 add with clamp to [-32768, 32767] to avoid distortion.
+            src = _array.array('h', raw[:copy_len])
+            dst = _array.array('h', bytes(timeline[start_byte:end_byte]))
+            for i in range(len(src)):
+                v = dst[i] + src[i]
+                dst[i] = 32767 if v > 32767 else (-32768 if v < -32768 else v)
+            timeline[start_byte:end_byte] = dst.tobytes()
 
         output = self.cfg.work_dir / f"{prefix}tts_aligned.wav"
         with wave.open(str(output), 'wb') as w:
