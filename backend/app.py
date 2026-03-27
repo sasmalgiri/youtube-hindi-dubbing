@@ -1354,6 +1354,8 @@ def _job_config(job: Job) -> Dict[str, Any]:
         tts = "Chatterbox"
     elif req.use_elevenlabs:
         tts = "ElevenLabs"
+    elif req.use_cosyvoice:
+        tts = "CosyVoice 2"
     elif req.use_coqui_xtts:
         tts = "Coqui XTTS"
     elif req.use_google_tts:
@@ -1361,9 +1363,18 @@ def _job_config(job: Job) -> Dict[str, Any]:
     else:
         tts = "Edge-TTS"
     engine_labels = {
-        "auto": "Auto", "turbo": "Turbo (Groq+SambaNova)", "gemini": "Gemini",
-        "groq": "Groq", "sambanova": "SambaNova", "google_polish": "Google+LLM Polish",
-        "ollama": "Ollama", "google": "Google Translate", "hinglish": "Hinglish AI",
+        "auto":         "Auto",
+        "turbo":        "Turbo (Groq+SambaNova)",
+        "gemini":       "Gemini",
+        "groq":         "Groq",
+        "sambanova":    "SambaNova",
+        "google_polish":"Google+LLM Polish",
+        "ollama":       "Ollama",
+        "google":       "Google Translate",
+        "hinglish":     "Hinglish AI",
+        "nllb_polish":  "IndicTrans2+",
+        "nllb":         "IndicTrans2",
+        "chain_dub":    "Chain Dub",
     }
     return {
         "asr_model": getattr(req, "asr_model", "large-v3"),
