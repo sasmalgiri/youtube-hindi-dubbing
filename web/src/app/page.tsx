@@ -33,6 +33,7 @@ export default function HomePage() {
         audio_bitrate: '192k',
         encode_preset: 'veryfast',
         split_duration: 0,
+        fast_assemble: true,
         dub_chain: [],
     });
     const [currentUrl, setCurrentUrl] = useState('');

@@ -21,6 +21,7 @@ export interface DubbingSettings {
     audio_bitrate: string;
     encode_preset: string;
     split_duration: number;
+    fast_assemble: boolean;
     dub_chain: string[];
 }
 
@@ -61,7 +62,8 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                 <div className="px-5 pb-5 space-y-5 animate-slide-up border-t border-border pt-4">
                     {/* ── Transcription Section ── */}
                     <div>
-                        <p className="text-sm font-medium text-text-primary mb-3">Transcription (Whisper)</p>
+                        <p className="text-sm font-medium text-text-primary mb-1">Transcription (Whisper)</p>
+                        <p className="text-[10px] text-text-muted mb-3">Converts speech in the video to text. Larger models are slower but more accurate.</p>
                         <div className="space-y-3">
                             <div>
                                 <p className="text-xs text-text-muted mb-1.5">Whisper Model</p>
@@ -154,7 +156,8 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
 
                     {/* ── Translation Section ── */}
                     <div>
-                        <p className="text-sm font-medium text-text-primary mb-3">Translation Engine</p>
+                        <p className="text-sm font-medium text-text-primary mb-1">Translation Engine</p>
+                        <p className="text-[10px] text-text-muted mb-3">How the transcribed text gets translated. Auto picks the best for Hindi. IndicTrans2+ gives best Hindi quality (local AI + LLM polish + rule cleanup).</p>
                         <div className="grid grid-cols-5 gap-2 mb-3">
                             {[
                                 { value: 'auto', label: 'Auto', desc: 'Best available' },
@@ -246,7 +249,8 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
 
                     {/* TTS Engines */}
                     <div>
-                        <p className="text-sm font-medium text-text-primary mb-3">TTS Engines</p>
+                        <p className="text-sm font-medium text-text-primary mb-1">TTS Engines</p>
+                        <p className="text-[10px] text-text-muted mb-3">Text-to-speech converts translated text to audio. First enabled engine is used. Chatterbox = most human but English only. Edge-TTS = best for Hindi.</p>
                         <div className="space-y-3">
                             {/* Chatterbox */}
                             <div className="flex items-center justify-between">
@@ -420,7 +424,8 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
 
                     {/* ── Audio & Performance Section ── */}
                     <div>
-                        <p className="text-sm font-medium text-text-primary mb-3">Audio & Performance</p>
+                        <p className="text-sm font-medium text-text-primary mb-1">Audio & Performance</p>
+                        <p className="text-[10px] text-text-muted mb-3">Controls how audio and video are assembled. Audio Priority lets TTS speak naturally without speed changes.</p>
                         <div className="space-y-3">
                             {/* Audio Priority */}
                             <div className="flex items-center justify-between">
@@ -499,11 +504,32 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                                     ))}
                                 </div>
                             </div>
+
+                            {/* Fast Assemble */}
+                            <div className="flex items-center justify-between">
+                                <div>
+                                    <p className="text-sm text-text-primary">Fast Assemble</p>
+                                    <p className="text-xs text-text-muted">In-memory audio (instant). Off = ffmpeg mixing (slower, preserves overlapping audio)</p>
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={() => update({ fast_assemble: !settings.fast_assemble })}
+                                    className={`
+                                        w-11 h-6 rounded-full transition-colors relative
+                                        ${settings.fast_assemble ? 'bg-primary' : 'bg-white/10'}
+                                    `}
+                                >
+                                    <div className={`
+                                        w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                        ${settings.fast_assemble ? 'translate-x-6' : 'translate-x-1'}
+                                    `} />
+                                </button>
+                            </div>
                         </div>
 
                         {/* Split Long Videos */}
                         <div>
-                            <p className="text-xs text-text-muted mb-1.5">Split Long Videos</p>
+                            <p className="text-xs text-text-muted mb-1.5">Split Long Videos — breaks video into parts, dubs each separately. Avoids timeout/crashes on 1h+ videos.</p>
                             <div className="grid grid-cols-4 gap-2">
                                 {[
                                     { value: 0, label: 'Off', desc: 'No splitting' },

@@ -140,6 +140,7 @@ class JobCreateRequest(BaseModel):
     audio_bitrate: str = "192k"
     encode_preset: str = "veryfast"
     split_duration: int = 0     # 0 = no split, 30/40 = split every N minutes
+    fast_assemble: bool = True  # True = instant in-memory, False = ffmpeg (preserves overlaps)
     dub_chain: List[str] = []  # e.g. ["en", "hi"] — dub through languages sequentially
 
     @validator("target_language", "source_language")
@@ -458,6 +459,7 @@ def _run_job(job: Job, req: JobCreateRequest):
             audio_bitrate=req.audio_bitrate,
             encode_preset=req.encode_preset,
             split_duration=req.split_duration,
+            fast_assemble=req.fast_assemble,
         )
 
         pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job),
@@ -615,6 +617,7 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             use_edge_tts=req.use_edge_tts, prefer_youtube_subs=False,
             multi_speaker=req.multi_speaker, audio_priority=req.audio_priority,
             audio_bitrate=req.audio_bitrate, encode_preset=req.encode_preset,
+            fast_assemble=req.fast_assemble,
         )
         p = Pipeline(cfg, on_progress=callback, cancel_check=job.cancel_event.is_set)
         p.video_title = job.video_title
@@ -683,6 +686,7 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             audio_priority=req.audio_priority,
             audio_bitrate=req.audio_bitrate,
             encode_preset=req.encode_preset,
+            fast_assemble=req.fast_assemble,
         )
 
         pipeline = Pipeline(cfg, on_progress=_part_callback,
@@ -892,6 +896,7 @@ async def create_job_upload(
     audio_bitrate: str = Form("192k"),
     encode_preset: str = Form("veryfast"),
     split_duration: int = Form(0),
+    fast_assemble: str = Form("true"),
     voice: str = Form("hi-IN-SwaraNeural"),
 ):
     """Create a dubbing job from an uploaded video file."""
@@ -939,6 +944,7 @@ async def create_job_upload(
             audio_bitrate=audio_bitrate,
             encode_preset=encode_preset,
             split_duration=split_duration,
+            fast_assemble=_bool(fast_assemble),
         )
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -989,6 +995,7 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
             audio_priority=req.audio_priority,
             audio_bitrate=req.audio_bitrate,
             encode_preset=req.encode_preset,
+            fast_assemble=req.fast_assemble,
         )
 
         pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job),
@@ -1084,6 +1091,7 @@ async def create_job_with_srt(
     audio_bitrate: str = Form("192k"),
     encode_preset: str = Form("veryfast"),
     split_duration: int = Form(0),
+    fast_assemble: str = Form("true"),
     voice: str = Form("hi-IN-SwaraNeural"),
 ):
     """Create a dubbing job from a video (URL or file) + pre-translated SRT file.
@@ -1145,6 +1153,7 @@ async def create_job_with_srt(
             audio_bitrate=audio_bitrate,
             encode_preset=encode_preset,
             split_duration=split_duration,
+            fast_assemble=_bool(fast_assemble),
         )
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)

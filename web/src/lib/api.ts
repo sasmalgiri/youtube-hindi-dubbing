@@ -40,6 +40,7 @@ export interface JobCreateRequest {
     audio_bitrate?: string;
     encode_preset?: string;
     split_duration?: number;
+    fast_assemble?: boolean;
     dub_chain?: string[];
 }
 

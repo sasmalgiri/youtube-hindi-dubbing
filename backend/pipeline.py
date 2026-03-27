@@ -398,6 +398,8 @@ class PipelineConfig:
     encode_preset: str = "veryfast"
     # Split long videos into parts (0 = no split, 30/40 = split every N minutes)
     split_duration: int = 0
+    # Fast assemble: use in-memory bytearray (instant) vs ffmpeg adelay+amix (slower, preserves overlaps)
+    fast_assemble: bool = True
 
 
 class Pipeline:
@@ -5078,13 +5080,14 @@ class Pipeline:
         fitted = self._speed_fit_segments(tts_data)
 
         # Build the dubbed audio timeline
-        # For large segment counts, use fast in-memory bytearray method
-        # For smaller counts, use ffmpeg adelay+amix (preserves overlapping audio better)
+        # Fast mode: in-memory bytearray (instant, overwrites overlaps)
+        # Normal mode: ffmpeg adelay+amix (slower, mixes overlapping audio)
         self._report("assemble", 0.2, "Placing audio segments on timeline...")
-        if len(fitted) > 500:
+        if self.cfg.fast_assemble:
             self._report("assemble", 0.2, f"Fast in-memory timeline ({len(fitted)} segments)...")
             dubbed_audio = self._build_timeline(fitted, total_video_duration, prefix="fast_")
         else:
+            self._report("assemble", 0.2, f"FFmpeg timeline ({len(fitted)} segments, preserves overlaps)...")
             dubbed_audio = self._build_timeline_no_cut(fitted, total_video_duration, prefix="fast_")
 
         # Mix with original background music (vocals removed) if requested
