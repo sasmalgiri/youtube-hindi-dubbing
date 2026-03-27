@@ -394,9 +394,9 @@ class PipelineConfig:
     # Audio priority: let TTS speak at natural pace, video freezes/extends to match
     audio_priority: bool = False
     # Audio quality: bitrate for final output (128k, 192k, 256k, 320k)
-    audio_bitrate: str = "192k"
+    audio_bitrate: str = "320k"
     # Video encode speed: ultrafast (fastest), veryfast, fast, medium (best quality)
-    encode_preset: str = "veryfast"
+    encode_preset: str = "medium"
     # Split long videos into parts (0 = no split, 30/40 = split every N minutes)
     split_duration: int = 0
     # Fast assemble: use in-memory bytearray (instant) vs ffmpeg adelay+amix (slower, preserves overlaps)
@@ -1266,7 +1266,7 @@ class Pipeline:
             print("[NVENC] GPU encoding available — using h264_nvenc", flush=True)
         return self._has_nvenc
 
-    def _video_encode_args(self, crf: str = "20", force_cpu: bool = False) -> list:
+    def _video_encode_args(self, crf: str = "18", force_cpu: bool = False) -> list:
         """Return FFmpeg video encoder arguments — NVENC if available, else libx264.
 
         force_cpu: use libx264 even if NVENC is available (for short clips where
@@ -2516,6 +2516,17 @@ class Pipeline:
             self._report("translate", 0.05, "Using Ollama (local LLM) for translation...")
             self._translate_segments_ollama(segments)
             return
+        elif engine == "chain_dub":
+            self._report("translate", 0.01, "Chain Dub: Pass 1 — IndicTrans2 → LLM → Rules...")
+            self._translate_segments_nllb_polish(segments)
+            if len(turbo_engines) >= 1:
+                names = " + ".join(e[0] for e in turbo_engines)
+                self._report("translate", 0.50, f"Chain Dub: Pass 2 — {names} refinement...")
+                self._translate_segments_turbo_refine(segments, turbo_engines)
+                self._report("translate", 0.99, f"Chain Dub complete: NLLB+Polish → {names} refine!")
+            else:
+                self._report("translate", 0.99, "Chain Dub: Refine skipped (need Groq or SambaNova key)")
+            return
         elif engine == "nllb_polish":
             self._report("translate", 0.02, "Using NLLB → LLM → Rules pipeline...")
             self._translate_segments_nllb_polish(segments)
@@ -2775,6 +2786,109 @@ class Pipeline:
                 completed += 1
                 self._report("translate", 0.1 + 0.9 * (completed / total_batches),
                              f"TURBO: {completed}/{total_batches} batches ({engine_name})")
+
+    def _translate_segments_turbo_refine(self, segments, engines):
+        """TURBO REFINE: Second pass — polish already-translated text using parallel engines.
+
+        Takes text_translated from Pass 1 and asks LLMs to refine for natural,
+        spoken dubbing quality. Round-robins batches across Groq + SambaNova.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import requests as _requests
+
+        target_name = LANGUAGE_NAMES.get(self.cfg.target_language, self.cfg.target_language)
+        is_hindi = self.cfg.target_language in ("hi", "hi-IN")
+
+        if is_hindi:
+            refine_system = (
+                "You are a Hindi dubbing quality reviewer. You receive Hindi dubbing lines "
+                "that were already translated and polished.\n\n"
+                "Your job: REVIEW and REFINE each line for maximum naturalness and flow.\n\n"
+                "RULES:\n"
+                "1. Fix any remaining formal/unnatural phrasing — make it sound 100% spoken\n"
+                "2. Keep the EXACT SAME meaning — only improve how it sounds\n"
+                "3. If a line is already perfect, return it unchanged\n"
+                "4. Ensure rhythm and breath-pauses work for voice dubbing\n"
+                "5. Keep English loanwords Indians commonly use\n"
+                "6. Output ONLY numbered refined lines. No notes or explanations.\n"
+            )
+            refine_prefix = "REFINE these Hindi dubbing lines for maximum spoken naturalness:\n\n"
+        else:
+            refine_system = (
+                f"You are a {target_name} dubbing quality reviewer. Review and refine these "
+                f"already-translated {target_name} dubbing lines for maximum naturalness.\n"
+                f"Fix awkward phrasing, keep meaning intact. If a line is perfect, keep it.\n"
+                f"Output ONLY numbered refined lines."
+            )
+            refine_prefix = f"Refine these {target_name} dubbing lines:\n\n"
+
+        batch_size = 50
+        total_batches = (len(segments) + batch_size - 1) // batch_size
+        num_engines = len(engines)
+
+        batches = []
+        for batch_idx in range(total_batches):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, len(segments))
+            batches.append((batch_idx, segments[start:end]))
+
+        completed = 0
+        with ThreadPoolExecutor(max_workers=num_engines * 2) as pool:
+            futures = {}
+            for batch_idx, batch in batches:
+                engine_name, api_key = engines[batch_idx % num_engines]
+                url, model = self.TURBO_ENGINE_CONFIG[engine_name]
+
+                lines = [f"{i+1}. {seg['text_translated']}" for i, seg in enumerate(batch)]
+                user_msg = refine_prefix + "\n".join(lines)
+
+                fut = pool.submit(
+                    self._turbo_refine_batch,
+                    batch, url, api_key, model, engine_name,
+                    refine_system, user_msg)
+                futures[fut] = (batch_idx, batch, engine_name)
+
+            for fut in as_completed(futures):
+                batch_idx, batch, engine_name = futures[fut]
+                refined = fut.result()
+                if refined:
+                    for i, seg in enumerate(batch):
+                        if refined[i]:
+                            seg["text_translated"] = refined[i]
+
+                completed += 1
+                self._report("translate", 0.50 + 0.48 * (completed / total_batches),
+                             f"Turbo Refine: {completed}/{total_batches} batches ({engine_name})")
+
+    def _turbo_refine_batch(self, batch, api_url, api_key, model, engine_name,
+                            system_msg, user_msg):
+        """Send a refinement batch to an OpenAI-compatible API. Returns list or None."""
+        import requests as _requests
+        retries = 3
+        for attempt in range(retries):
+            try:
+                resp = _requests.post(
+                    api_url,
+                    headers={"Authorization": f"Bearer {api_key}",
+                             "Content-Type": "application/json"},
+                    json={
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": system_msg},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        "temperature": 0.5,
+                        "max_tokens": 8192,
+                    },
+                    timeout=90,
+                )
+                resp.raise_for_status()
+                text = resp.json()["choices"][0]["message"]["content"]
+                return self._parse_numbered_translations(text, len(batch))
+            except Exception as e:
+                if attempt < retries - 1:
+                    time.sleep(2 * (attempt + 1))
+        return None
 
     def _translate_segments_ollama(self, segments, force_model: str = ""):
         """Translate segments using local Ollama LLM in batches."""
@@ -3403,6 +3517,7 @@ class Pipeline:
                 check=True, capture_output=True,
             )
             mp3.unlink(missing_ok=True)
+            self._enhance_tts_wav(wav)
 
             tts_dur = self._get_duration(wav)
             tts_data.append({
@@ -4140,6 +4255,7 @@ class Pipeline:
                         )
                         wav_path.unlink(missing_ok=True)
                         resampled.rename(wav_path)
+                    self._enhance_tts_wav(wav_path)
 
                 except Exception as e:
                     self._report("synthesize", 0.1 + 0.8 * ((i + 1) / len(segments)),
@@ -5142,17 +5258,51 @@ class Pipeline:
         self._mux_replace_audio(video_path, dubbed_audio, self.cfg.output_path)
         self._report("assemble", 0.95, "Fast assembly complete!")
 
+    # ── Audio enhancement ─────────────────────────────────────────────────
+    def _enhance_tts_wav(self, wav_path: Path) -> Path:
+        """Normalize speech loudness and apply light compression per TTS segment.
+
+        Uses:
+        - speechnorm: speech-aware loudness normalization (equalises quiet/loud segments)
+        - acompressor: light 3:1 compression for consistent dynamics
+        Result: every segment plays at the same perceived loudness, no more
+        jarring volume jumps between sentences.
+        """
+        enhanced = wav_path.with_suffix(".enh.wav")
+        try:
+            subprocess.run(
+                [
+                    self._ffmpeg, "-y", "-i", str(wav_path),
+                    "-af", (
+                        "speechnorm=e=50:r=0.0001:l=1,"
+                        "acompressor=threshold=-20dB:ratio=3:attack=5:release=50:makeup=2"
+                    ),
+                    "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                    str(enhanced),
+                ],
+                check=True, capture_output=True,
+            )
+            wav_path.unlink(missing_ok=True)
+            enhanced.rename(wav_path)
+        except Exception:
+            enhanced.unlink(missing_ok=True)  # keep original on failure
+        return wav_path
+
     # ── Video muxing ─────────────────────────────────────────────────────
     def _mux_replace_audio(self, video_path: Path, audio_path: Path, output_path: Path):
+        """Mux video + dubbed audio. Applies EBU R128 loudness normalisation
+        (-14 LUFS, YouTube standard) for professional broadcast-level output."""
         subprocess.run(
             [
                 self._ffmpeg, "-y",
                 "-i", str(video_path),
                 "-i", str(audio_path),
                 "-c:v", "copy",
-                "-c:a", "aac", "-b:a", self.cfg.audio_bitrate,
                 "-map", "0:v:0",
                 "-map", "1:a:0",
+                # EBU R128 loudness target: -14 LUFS (YouTube standard), -1.5 dB true peak
+                "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
+                "-c:a", "aac", "-b:a", self.cfg.audio_bitrate,
                 str(output_path),
             ],
             check=True,
