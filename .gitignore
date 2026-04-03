@@ -69,3 +69,5 @@ backend/dubbed_outputs/
 backend/cache/
 backend/work/
 backend/jobs.db
+CosyVoice/
+.claude/worktrees/

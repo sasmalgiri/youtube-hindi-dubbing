@@ -23,70 +23,6 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from srt_utils import write_srt
-import cache as _cache
-
-
-# ── Groq API Key Rotator ────────────────────────────────────────────────────
-# Rotates between multiple GROQ_API_KEY, GROQ_API_KEY_2, GROQ_API_KEY_3, etc.
-# Auto-skips keys that hit rate limits. Thread-safe.
-class _GroqKeyRotator:
-    def __init__(self):
-        import threading
-        self._lock = threading.Lock()
-        self._keys = []
-        self._index = 0
-        self._failures = {}  # key_index → last_failure_time
-        self._loaded = False
-
-    def _load_keys(self):
-        if self._loaded:
-            return
-        self._loaded = True
-        # Load all GROQ_API_KEY variants
-        main = os.environ.get("GROQ_API_KEY", "").strip()
-        if main:
-            self._keys.append(main)
-        for i in range(2, 20):
-            k = os.environ.get(f"GROQ_API_KEY_{i}", "").strip()
-            if k:
-                self._keys.append(k)
-
-    def get_key(self) -> str:
-        """Get the next available Groq API key (round-robin, skip rate-limited)."""
-        with self._lock:
-            self._load_keys()
-            if not self._keys:
-                return ""
-            now = time.time()
-            # Try each key, skip recently failed ones (cooldown 30s)
-            for _ in range(len(self._keys)):
-                idx = self._index % len(self._keys)
-                self._index += 1
-                last_fail = self._failures.get(idx, 0)
-                if now - last_fail > 30:  # 30s cooldown after rate limit
-                    return self._keys[idx]
-            # All keys rate-limited — return first anyway (will retry)
-            return self._keys[0]
-
-    def report_rate_limit(self, key: str):
-        """Mark a key as rate-limited."""
-        with self._lock:
-            for i, k in enumerate(self._keys):
-                if k == key:
-                    self._failures[i] = time.time()
-                    break
-
-    def count(self) -> int:
-        """Number of available keys."""
-        self._load_keys()
-        return len(self._keys)
-
-_groq_keys = _GroqKeyRotator()
-
-
-def get_groq_key() -> str:
-    """Get the next available Groq API key (rotated)."""
-    return _groq_keys.get_key()
 
 
 # ── IndicTrans2 / NLLB Singleton (Stage A: Meaning Model) ────────────────────
@@ -448,7 +384,6 @@ class PipelineConfig:
     original_volume: float = 0.10
     use_cosyvoice: bool = True
     use_chatterbox: bool = False
-    use_indic_parler: bool = False
     use_elevenlabs: bool = False
     use_google_tts: bool = False
     use_coqui_xtts: bool = False
@@ -457,14 +392,8 @@ class PipelineConfig:
     use_yt_translate: bool = False   # Download YouTube's auto-translated subs in target lang
     multi_speaker: bool = False
     transcribe_only: bool = False
-    simplify_english: bool = True
-    step_by_step: bool = False
-    srt_needs_translation: bool = False
     # Audio priority: let TTS speak at natural pace, video freezes/extends to match
     audio_priority: bool = False
-    audio_untouchable: bool = False
-    post_tts_level: str = "full"
-    dub_duration: int = 0
     # Audio quality: bitrate for final output (128k, 192k, 256k, 320k)
     audio_bitrate: str = "320k"
     # Video encode speed: ultrafast (fastest), veryfast, fast, medium (best quality)
@@ -476,10 +405,6 @@ class PipelineConfig:
     # Pronunciation dictionary: JSON file mapping source terms → target phonetic spellings
     # Example: {"Pikachu": "Pikachu", "GPT": "जी-पी-टी"}
     pronunciation_path: str = ""
-    # Manual review queue: save JSON of segments that failed QC after all retries
-    enable_manual_review: bool = True
-    # WhisperX forced alignment: refine word-level timestamps after transcription
-    use_whisperx: bool = False
 
 
 class Pipeline:
@@ -489,13 +414,10 @@ class Pipeline:
     N_CHANNELS = 2
 
     def __init__(self, cfg: PipelineConfig, on_progress: Optional[ProgressCallback] = None,
-                 cancel_check: Optional[Callable[[], bool]] = None,
-                 pause_event=None):
+                 cancel_check: Optional[Callable[[], bool]] = None):
         self.cfg = cfg
         self._on_progress = on_progress or (lambda *_: None)
         self._cancel_check = cancel_check or (lambda: False)
-        self._pause_event = pause_event
-        self.paused_at: Optional[str] = None
         self.segments: List[Dict] = []
         self.video_title: str = ""
         self.qa_score: Optional[float] = None
@@ -506,7 +428,7 @@ class Pipeline:
 
         # Load pronunciation dictionary (maps source terms → target phonetic spellings)
         self._pronunciation: Dict[str, str] = {}
-        pron_path = cfg.pronunciation_path or str(Path(__file__).resolve().parent / "pronunciation.json")
+        pron_path = cfg.pronunciation_path or str(cfg.work_dir.parent / "pronunciation.json")
         try:
             import json as _json
             p = Path(pron_path)
@@ -625,58 +547,6 @@ class Pipeline:
     def _report(self, step: str, progress: float, message: str):
         """Report progress to callback."""
         self._on_progress(step, min(progress, 1.0), message)
-
-    # ── Emotion detection ────────────────────────────────────────────────
-    # Keyword lists for heuristic emotion tagging
-    _EMOTION_PUNCHY_WORDS = frozenset([
-        "fight", "attack", "kill", "war", "battle", "danger", "power", "win", "lose",
-        "destroy", "epic", "finally", "reveal", "shock", "now", "stop", "never",
-        "defeat", "enemy", "blood", "scream", "boss", "rank", "unlock", "level",
-        # Hindi equivalents
-        "लड़ाई", "हमला", "शक्ति", "जीत", "हार", "ताकत", "खतरा", "रहस्य", "अब",
-    ])
-    _EMOTION_EMOTIONAL_WORDS = frozenset([
-        "love", "miss", "cry", "sad", "heart", "please", "sorry", "alone", "die",
-        "remember", "dream", "hope", "fear", "truth", "promise", "mother", "father",
-        "friend", "lost", "pain", "hurt", "tears", "farewell", "goodbye",
-        # Hindi equivalents
-        "प्यार", "याद", "रोना", "दुख", "दिल", "माफ", "सच", "वादा", "अकेला", "दर्द",
-    ])
-    _EMOTION_COMEDIC_WORDS = frozenset([
-        "funny", "joke", "laugh", "silly", "ridiculous", "seriously", "really",
-        "unbelievable", "wait", "what", "huh", "dude", "bro", "man",
-        # Hindi equivalents
-        "मज़ाक", "हँसी", "यार", "भाई", "सच में", "अरे",
-    ])
-
-    def _detect_segment_emotion(self, seg: Dict) -> str:
-        """Heuristic emotion tagger. Returns 'neutral' | 'punchy' | 'emotional' | 'comedic'.
-
-        Uses punctuation, duration, and keyword signals. No extra API call.
-        Order of precedence: comedic > emotional > punchy > neutral.
-        """
-        text = (seg.get("text", "") + " " + seg.get("text_translated", "")).lower()
-        dur = seg.get("end", 0) - seg.get("start", 0)
-
-        # Comedic: questions + common comedy markers
-        q_count = text.count("?")
-        has_comedic_kw = any(w in text for w in self._EMOTION_COMEDIC_WORDS)
-        if q_count >= 2 or (q_count >= 1 and has_comedic_kw):
-            return "comedic"
-
-        # Emotional: ellipses / slow pace / emotional keywords
-        has_ellipsis = "..." in text or "…" in text
-        has_emotional_kw = any(w in text for w in self._EMOTION_EMOTIONAL_WORDS)
-        if has_emotional_kw or (has_ellipsis and dur > 3.0):
-            return "emotional"
-
-        # Punchy: exclamations / short duration / action keywords
-        excl = text.count("!")
-        has_punchy_kw = any(w in text for w in self._EMOTION_PUNCHY_WORDS)
-        if excl >= 1 or has_punchy_kw or dur < 2.0:
-            return "punchy"
-
-        return "neutral"
 
     # ── Speaker Diarization ───────────────────────────────────────────────
 
@@ -1036,15 +906,8 @@ class Pipeline:
 
             if sub_segments:
                 self.segments = sub_segments
-                # Set fields for downstream compatibility + skip flag
-                for seg in sub_segments:
-                    seg.setdefault("_qc_issues", [])
-                    seg.setdefault("_protected_terms", [])
-                    seg.setdefault("emotion", "neutral")
-                    seg.setdefault("text_en_clean", seg.get("text", ""))
-                self._yt_subs_fast_path = True  # Skip ALL English processing
                 self._report("transcribe", 1.0,
-                             f"YouTube subs: {len(sub_segments)} segments — skipping English processing")
+                             f"Using YouTube subtitles ({len(sub_segments)} segments, skipped Whisper)")
             else:
                 if self.cfg.prefer_youtube_subs:
                     self._report("transcribe", 0.05, "No subtitles found, using Whisper...")
@@ -1063,21 +926,6 @@ class Pipeline:
         text_segments = [s for s in self.segments if s.get("text", "").strip()]
         if not text_segments:
             raise RuntimeError("No speech detected in the video")
-
-        # ── YouTube subs fast path: skip ALL English processing to Step 4 ──
-        if getattr(self, '_yt_subs_fast_path', False):
-            self._ref_english_subs = None
-            self._voice_map = None
-            self._keyterms = {}
-            from srt_utils import write_srt as _fast_ws
-            src_srt = self.cfg.work_dir / "transcript_source.srt"
-            if not src_srt.exists():
-                _fast_ws(text_segments, src_srt, text_key="text")
-            self._report("transcribe", 1.0,
-                         f"Fast path: {len(text_segments)} YouTube segments → translation")
-            # SKIP to Step 4 — run _run_from_step4 which contains translate → TTS → assemble
-            self._run_from_step4(text_segments, video_path, audio_raw)
-            return
 
         # Fetch English reference subs for QA (save for post-translation comparison)
         self._ref_english_subs = None
@@ -1160,9 +1008,6 @@ class Pipeline:
                 self._report("translate", 0.0, f"Translating segments to {target_name}...")
                 self._translate_segments(text_segments)
                 self.segments = text_segments
-                # Tag emotion on each segment after translation
-                for _seg in text_segments:
-                    _seg["emotion"] = self._detect_segment_emotion(_seg)
                 self._report("translate", 1.0, "Translation complete")
                 # Cache translation for crash recovery
                 self._save_segments_cache(text_segments, "translate")
@@ -1256,205 +1101,6 @@ class Pipeline:
         out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
         shutil.copy2(srt_translated, out_srt)
 
-        self._report("assemble", 1.0, "Done!")
-
-    def _run_from_step4(self, text_segments, video_path, audio_raw):
-        """Run Step 4 (translate) through Step 6 (assembly) — used by YouTube subs fast path.
-
-        Skips ALL English processing (keyterms, prosody, merge, cue rebuild, simplify).
-        Goes straight: translate → TTS → assemble.
-        """
-        from srt_utils import write_srt
-        import shutil
-
-        self.segments = text_segments
-
-        # Step 4: Translate
-        self._report("translate", 0.0, "Translating...")
-        self._translate_segments(text_segments)
-        self.segments = text_segments
-
-        # Rule engine cleanup
-        is_hindi = self.cfg.target_language in ("hi", "hi-IN")
-        if is_hindi:
-            for seg in text_segments:
-                seg["text_translated"] = _hindi_rules.apply(seg.get("text_translated", ""))
-
-        # Write translated SRT
-        srt_translated = self.cfg.work_dir / f"transcript_{self.cfg.target_language}.srt"
-        write_srt(self.segments, srt_translated, text_key="text_translated")
-
-        self._report("translate", 1.0, "Translation complete")
-
-        # Step 5: TTS
-        self._report("synthesize", 0.0, f"Generating speech ({self.cfg.tts_voice})...")
-        tts_data = self._generate_tts_natural(text_segments)
-        if not tts_data:
-            raise RuntimeError("TTS produced no audio segments")
-
-        self._report("synthesize", 0.9, "TTS complete")
-        for t in tts_data:
-            t.pop("_already_sped", None)
-        self._report("synthesize", 1.0, f"{len(tts_data)} segments ready")
-
-        # Step 5.5: Global speed
-        self.cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
-        video_duration = self._get_duration(video_path)
-
-        total_tts = sum(t.get("duration", 0) for t in tts_data)
-        total_slots = sum(max(0, t.get("end", 0) - t.get("start", 0)) for t in tts_data)
-        if total_slots > 0 and total_tts > 0:
-            ratio = total_tts / total_slots
-            speed = min(max(ratio, 1.0), 1.25) if ratio > 0.95 else 1.0
-            self._report("assemble", 0.02, f"Speed: {speed:.2f}x (ratio {ratio:.2f}x)")
-            if abs(speed - 1.0) > 0.01:
-                from concurrent.futures import ThreadPoolExecutor
-                def _gs(it):
-                    i, t = it
-                    s = self.cfg.work_dir / f"tts_global_{i:04d}.wav"
-                    self._time_stretch(t["wav"], speed, s)
-                    t["wav"] = s
-                    t["duration"] = t["duration"] / speed
-                with ThreadPoolExecutor(max_workers=12) as pool:
-                    list(pool.map(_gs, enumerate(tts_data)))
-
-        # Step 6: Assembly
-        self._report("assemble", 0.1, "Assembling...")
-        if len(tts_data) > 500:
-            self._assemble_fast_mux(video_path, audio_raw, tts_data, video_duration)
-        else:
-            self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
-
-        # Copy SRT
-        out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
-        if srt_translated.exists():
-            shutil.copy2(srt_translated, out_srt)
-
-        self._report("assemble", 1.0, "Done!")
-
-    def run_from_source_srt(self, source_srt_path: Path):
-        """Upload English SRT → translate → TTS → assemble.
-
-        User provides English (source) SRT. Pipeline translates it to target
-        language, then does TTS + assembly. NO transcription needed.
-
-        Flow: Load SRT → Translate → Rule Engine → TTS → Assembly
-        """
-        from srt_utils import parse_srt
-
-        self._ensure_ffmpeg()
-
-        # Step 1-2: Download + extract (need video for final output)
-        self.download_and_extract()
-        video_path = self._find_cached_video()
-        audio_raw = self.cfg.work_dir / "audio_raw.wav"
-        if not video_path:
-            raise RuntimeError("No video found for assembly")
-
-        # Load source English SRT
-        self._report("transcribe", 0.0, "Loading source English SRT...")
-        segments = parse_srt(source_srt_path, text_key="text")
-        if not segments:
-            raise RuntimeError("Source SRT is empty or invalid")
-
-        # Ensure text field is set
-        for seg in segments:
-            if not seg.get("text"):
-                seg["text"] = seg.get("text_translated", "")
-            seg.setdefault("_qc_issues", [])
-            seg.setdefault("_protected_terms", [])
-            seg.setdefault("emotion", "neutral")
-
-        text_segments = [s for s in segments if s.get("text", "").strip()]
-        self.segments = text_segments
-        self._report("transcribe", 1.0,
-                     f"Loaded {len(text_segments)} segments from SRT — translating...")
-
-        # Step 4-6: Translate → TTS → Assembly
-        self._run_from_step4(text_segments, video_path, audio_raw)
-
-    def _run_transcription(self):
-        """Run steps 1-3: download + extract + transcribe. Sets self.segments."""
-        self._ensure_ffmpeg()
-        video_path = self._find_cached_video()
-        if video_path:
-            self._report("download", 1.0, f"[cached] {video_path.name}")
-            if not self.video_title:
-                self.video_title = video_path.stem
-        else:
-            self._report("download", 0.0, "Downloading...")
-            video_path = self._ingest_source(self.cfg.source)
-            self._report("download", 1.0, f"Downloaded: {video_path.name}")
-        audio_raw = self.cfg.work_dir / "audio_raw.wav"
-        wav_16k = self.cfg.work_dir / "audio_16k.wav"
-        if audio_raw.exists() and audio_raw.stat().st_size > 0:
-            self._report("extract", 1.0, "[cached] Audio extracted")
-            if wav_16k.exists():
-                self._whisper_audio = wav_16k
-        else:
-            self._report("extract", 0.0, "Extracting audio...")
-            audio_raw = self._extract_audio(video_path)
-            self._report("extract", 1.0, "Audio extracted")
-        cached_segs = self._load_segments_cache("transcribe")
-        if cached_segs:
-            self.segments = cached_segs
-            self._report("transcribe", 1.0, f"[cached] {len(cached_segs)} segments")
-        else:
-            sub_segments = None
-            if self.cfg.prefer_youtube_subs and re.match(r"^https?://", self.cfg.source):
-                sub_segments = self._fetch_youtube_subtitles(self.cfg.source)
-            if self.cfg.prefer_youtube_subs and sub_segments:
-                self.segments = sub_segments
-            else:
-                whisper_audio = self._whisper_audio or audio_raw
-                self.segments = self._transcribe(whisper_audio)
-            text_segments = [s for s in self.segments if s.get("text", "").strip()]
-            if text_segments:
-                self._save_segments_cache(text_segments, "transcribe")
-
-    def _run_tts_and_assembly(self, text_segments, audio_raw_path):
-        """Run steps 5-6: TTS + assembly from pre-translated segments."""
-        from srt_utils import write_srt
-        import shutil
-        video_path = self._find_cached_video()
-        if not video_path:
-            raise RuntimeError("No video found for assembly")
-        audio_raw = Path(audio_raw_path)
-        srt_path = self.cfg.work_dir / f"transcript_{self.cfg.target_language}.srt"
-        write_srt(text_segments, srt_path, text_key="text_translated")
-        self._report("synthesize", 0.0, f"Generating speech ({self.cfg.tts_voice})...")
-        tts_data = self._generate_tts_natural(text_segments)
-        if not tts_data:
-            raise RuntimeError("TTS produced no audio segments")
-        for t in tts_data:
-            t.pop("_already_sped", None)
-        self._report("synthesize", 1.0, f"{len(tts_data)} segments ready")
-        self.cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
-        video_duration = self._get_duration(video_path)
-        total_tts = sum(t.get("duration", 0) for t in tts_data)
-        total_slots = sum(max(0, t.get("end", 0) - t.get("start", 0)) for t in tts_data)
-        if total_slots > 0 and total_tts > 0:
-            ratio = total_tts / total_slots
-            speed = min(max(ratio, 1.0), 1.25) if ratio > 0.95 else 1.0
-            self._report("assemble", 0.02, f"Speed: {speed:.2f}x")
-            if abs(speed - 1.0) > 0.01:
-                from concurrent.futures import ThreadPoolExecutor
-                def _gs(it):
-                    i, t = it
-                    s = self.cfg.work_dir / f"tts_global_{i:04d}.wav"
-                    self._time_stretch(t["wav"], speed, s)
-                    t["wav"] = s
-                    t["duration"] = t["duration"] / speed
-                with ThreadPoolExecutor(max_workers=12) as pool:
-                    list(pool.map(_gs, enumerate(tts_data)))
-        self._report("assemble", 0.1, "Assembling...")
-        if len(tts_data) > 500:
-            self._assemble_fast_mux(video_path, audio_raw, tts_data, video_duration)
-        else:
-            self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
-        out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
-        if srt_path.exists():
-            shutil.copy2(srt_path, out_srt)
         self._report("assemble", 1.0, "Done!")
 
     def download_and_extract(self):
@@ -2247,96 +1893,15 @@ class Pipeline:
     # ── Step 3b: Transcribe speech from audio ─────────────────────────────
     def _transcribe(self, wav_path: Path) -> List[Dict]:
         """Transcribe speech from audio — tries Groq Whisper API first (30x faster),
-        falls back to local faster-whisper if no API key or API fails.
-        Results are cached by audio SHA-256 + model + language."""
-        lang = self.cfg.source_language or "auto"
-        model = self.cfg.asr_model
-
-        # Check ASR cache first
-        cached = _cache.get_asr(wav_path, model, lang)
-        if cached is not None:
-            self._report("transcribe", 0.95, f"ASR cache hit — {len(cached)} segments (skipping transcription)")
-            return cached
-
-        # If user explicitly selected Groq Whisper, use it directly
-        if model == "groq-whisper":
-            groq_key = get_groq_key()
-            if not groq_key:
-                raise RuntimeError("Groq Whisper selected but no GROQ_API_KEY set")
-            self._report("transcribe", 0.1, "Using Groq Whisper (cloud, fastest)...")
-            segments = self._transcribe_groq(wav_path, groq_key)
-            if self.cfg.use_whisperx and segments:
-                segments = self._whisperx_align(wav_path, segments)
-            _cache.put_asr(wav_path, model, lang, segments)
-            return segments
-
-        groq_key = get_groq_key()
+        falls back to local faster-whisper if no API key or API fails."""
+        groq_key = os.environ.get("GROQ_API_KEY", "").strip()
         if groq_key:
             try:
-                segments = self._transcribe_groq(wav_path, groq_key)
-                if self.cfg.use_whisperx and segments:
-                    segments = self._whisperx_align(wav_path, segments)
-                _cache.put_asr(wav_path, model, lang, segments)
-                return segments
+                return self._transcribe_groq(wav_path, groq_key)
             except Exception as e:
                 self._report("transcribe", 0.1, f"Groq Whisper failed ({e}), using local model...")
 
-        segments = self._transcribe_local(wav_path)
-
-        # Optional: refine word-level timestamps with WhisperX forced alignment
-        if self.cfg.use_whisperx and segments:
-            segments = self._whisperx_align(wav_path, segments)
-
-        _cache.put_asr(wav_path, model, lang, segments)
-        return segments
-
-    def _whisperx_align(self, wav_path: Path, segments: List[Dict]) -> List[Dict]:
-        """Refine word-level timestamps using WhisperX forced alignment.
-        Falls back to original segments if whisperx is not installed."""
-        try:
-            import whisperx
-            import torch
-
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            lang = self.cfg.source_language
-            if not lang or lang == "auto":
-                lang = "en"
-
-            self._report("transcribe", 0.97, "Running WhisperX forced alignment...")
-            align_model, metadata = whisperx.load_align_model(
-                language_code=lang, device=device
-            )
-            result = whisperx.align(
-                segments, align_model, metadata, str(wav_path), device,
-                return_char_alignments=False,
-            )
-            refined = result.get("segments", segments)
-            # Normalise to our segment dict format (ensure start/end/text present)
-            # Preserve all original fields (e.g. speaker_id for multi-speaker mode)
-            out = []
-            for seg in refined:
-                entry = {**seg,  # Preserve original fields first
-                    "start": float(seg.get("start", 0)),
-                    "end":   float(seg.get("end", 0)),
-                    "text":  seg.get("text", "").strip(),
-                }
-                words = seg.get("words")
-                if words:
-                    entry["words"] = [
-                        {"word": w.get("word", "").strip(),
-                         "start": float(w.get("start", entry["start"])),
-                         "end":   float(w.get("end", entry["end"]))}
-                        for w in words
-                    ]
-                out.append(entry)
-            self._report("transcribe", 0.99, f"WhisperX alignment complete ({len(out)} segments)")
-            return out
-        except ImportError:
-            print("[Pipeline] whisperx not installed — skipping forced alignment", flush=True)
-            return segments
-        except Exception as e:
-            print(f"[Pipeline] WhisperX alignment failed ({e}) — using original timestamps", flush=True)
-            return segments
+        return self._transcribe_local(wav_path)
 
     def _transcribe_groq(self, wav_path: Path, api_key: str) -> List[Dict]:
         """Transcribe using Groq Whisper API — ~25s per hour of audio.
@@ -2513,29 +2078,11 @@ class Pipeline:
         """Join all speech into one narrative, translate as a whole."""
         # Combine all transcribed text into one continuous story
         full_text = " ".join(s.get("text", "").strip() for s in text_segments if s.get("text", "").strip())
-        if not full_text.strip():
-            self._report("translate", 1.0, "No text to translate (empty segments)")
-            return "", ""
         self._report("translate", 0.2, f"Translating {len(full_text)} characters...")
 
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-        groq_key = get_groq_key()
+        groq_key = os.environ.get("GROQ_API_KEY", "").strip()
         engine = self.cfg.translation_engine
-        target_lang = self.cfg.target_language
-
-        # Determine effective engine name for cache key (use actual engine chosen in auto mode)
-        _eff_engine = engine
-        if engine == "auto":
-            if gemini_key:   _eff_engine = "gemini"
-            elif groq_key:   _eff_engine = "groq"
-            elif self._ollama_available(): _eff_engine = "ollama"
-            else:            _eff_engine = "google"
-
-        # Check translation cache
-        cached_translation = _cache.get_translation(full_text, _eff_engine, target_lang)
-        if cached_translation is not None:
-            self._report("translate", 0.95, "Translation cache hit — skipping re-translation")
-            return full_text, cached_translation
 
         # If a specific engine is selected, use it directly
         if engine == "hinglish" and self._ollama_available():
@@ -2566,7 +2113,6 @@ class Pipeline:
             self._report("translate", 0.25, "No GEMINI/GROQ/Ollama found, using Google Translate...")
             translated_text = self._translate_with_google(full_text)
 
-        _cache.put_translation(full_text, _eff_engine, target_lang, translated_text)
         return full_text, translated_text
 
     def _translate_with_gemini(self, full_text: str, api_key: str, speech_duration: float = 0) -> str:
@@ -2633,7 +2179,7 @@ class Pipeline:
                         time.sleep(wait)
                     else:
                         # Only translate the failed chunk via fallback, keep already-translated parts
-                        groq_key = get_groq_key()
+                        groq_key = os.environ.get("GROQ_API_KEY", "").strip()
                         if groq_key:
                             self._report("translate", 0.2, f"Gemini failed on chunk {i+1}: {e}, using Groq for this chunk...")
                             fallback = self._translate_with_groq(chunk, groq_key, chunk_duration)
@@ -2953,7 +2499,7 @@ class Pipeline:
     def _get_turbo_engines(self):
         """Get available engines for turbo parallel translation."""
         engines = []
-        groq_key = get_groq_key()
+        groq_key = os.environ.get("GROQ_API_KEY", "").strip()
         sambanova_key = os.environ.get("SAMBANOVA_API_KEY", "").strip()
         if groq_key:
             engines.append(("Groq", groq_key))
@@ -2968,7 +2514,7 @@ class Pipeline:
         Turbo mode: Groq + SambaNova in parallel (both Llama 3.3 70B).
         """
         openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        groq_key = get_groq_key()
+        groq_key = os.environ.get("GROQ_API_KEY", "").strip()
         sambanova_key = os.environ.get("SAMBANOVA_API_KEY", "").strip()
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
         engine = self.cfg.translation_engine
@@ -3196,17 +2742,12 @@ class Pipeline:
                     },
                     timeout=60,
                 )
-                if resp.status_code == 429:
-                    _groq_keys.report_rate_limit(api_key)
-                    api_key = get_groq_key()  # Switch to next key
                 resp.raise_for_status()
                 return self._parse_numbered_translations(
                     resp.json()["choices"][0]["message"]["content"], len(batch))
             except Exception:
                 if attempt < 2:
-                    _groq_keys.report_rate_limit(api_key)
-                    api_key = get_groq_key()  # Try next key on retry
-                    time.sleep(1)
+                    time.sleep(2 * (attempt + 1))
         return None
 
     # Engine configs for OpenAI-compatible APIs (all using Llama 3.3 70B)
@@ -3292,6 +2833,7 @@ class Pipeline:
         spoken dubbing quality. Round-robins batches across Groq + SambaNova.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
+        import requests as _requests
 
         target_name = LANGUAGE_NAMES.get(self.cfg.target_language, self.cfg.target_language)
         is_hindi = self.cfg.target_language in ("hi", "hi-IN")
@@ -3503,7 +3045,7 @@ class Pipeline:
 
             if not success:
                 # Fall back to Groq > Gemini > Google Translate
-                groq_key = get_groq_key()
+                groq_key = os.environ.get("GROQ_API_KEY", "").strip()
                 gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
                 if groq_key:
                     self._report("translate", 0.1, "GPT-4o failed, falling back to Groq...")
@@ -3557,7 +3099,7 @@ class Pipeline:
         self._report("translate", 0.40, "Stage 1 complete. Starting LLM polish...")
 
         # ── Stage 2: LLM Polish ──────────────────────────────────────────
-        groq_key = get_groq_key()
+        groq_key = os.environ.get("GROQ_API_KEY", "").strip()
         sambanova_key = os.environ.get("SAMBANOVA_API_KEY", "").strip()
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
 
@@ -3624,15 +3166,8 @@ class Pipeline:
             end = min(start + batch_size, total)
             batch = segments[start:end]
 
-            # Build numbered list with emotion mode hints
-            _MODE_HINTS_GP = {
-                "punchy": "[punchy]", "emotional": "[emotional]",
-                "comedic": "[comedic]", "neutral": "",
-            }
-            lines = [
-                f"{i+1}. {_MODE_HINTS_GP.get(seg.get('emotion', 'neutral'), '')} {seg['text_translated']}".strip()
-                for i, seg in enumerate(batch)
-            ]
+            # Build numbered list of Google-translated text
+            lines = [f"{i+1}. {seg['text_translated']}" for i, seg in enumerate(batch)]
             user_msg = polish_prefix + "\n".join(lines)
 
             polished = None
@@ -3752,7 +3287,7 @@ class Pipeline:
         self._report("translate", 0.35, "Stage 1/3 complete. Starting dubbing rewrite...")
 
         # ── Stage B: LLM dubbing polish ──────────────────────────────────
-        groq_key = get_groq_key()
+        groq_key = os.environ.get("GROQ_API_KEY", "").strip()
         sambanova_key = os.environ.get("SAMBANOVA_API_KEY", "").strip()
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
 
@@ -3812,21 +3347,9 @@ class Pipeline:
             self._report("translate", 0.35,
                          f"Stage 2/3: {engine_label} dubbing rewrite ({total_batches} batches)...")
 
-            # Emotion → rewrite mode instructions (added per-segment in the prompt)
-            _REWRITE_MODE_HINTS = {
-                "punchy":    "[MODE: punchy — short, dramatic, hype energy]",
-                "emotional": "[MODE: emotional — soft, heartfelt, slow rhythm]",
-                "comedic":   "[MODE: comedic — light, playful, natural sarcasm]",
-                "neutral":   "[MODE: neutral — clear, conversational, natural flow]",
-            }
-
             def _polish_one_batch(batch, batch_idx):
                 """Send batch to ALL available engines simultaneously, return first good result."""
-                lines = []
-                for i, seg in enumerate(batch):
-                    emotion = seg.get("emotion", "neutral")
-                    mode_hint = _REWRITE_MODE_HINTS.get(emotion, "")
-                    lines.append(f"{i+1}. {mode_hint} {seg['text_translated']}")
+                lines = [f"{i+1}. {seg['text_translated']}" for i, seg in enumerate(batch)]
                 user_msg = polish_prefix + "\n".join(lines)
 
                 def _call_llm(name, key):
@@ -4116,13 +3639,6 @@ class Pipeline:
     # Speed limits: slow TTS → speed up to max 1.1x, long TTS → speed up to max 1.25x
     SPEED_MIN = 1.0 / 1.1    # 0.909 — slowest we allow (1.1x slower than natural)
     SPEED_MAX = 1.25          # fastest we allow (1.25x faster than natural)
-
-    # Spec-aligned duration fitting thresholds (per production-grade dubbing spec)
-    FIT_PASS_MS = 80          # ≤80ms error → accept as-is (no stretch)
-    FIT_STRETCH_MS = 150      # ≤150ms → fine stretch within preferred ratio
-    FIT_REWRITE_MS = 250      # >250ms → flag for rewrite (still stretch if within hard limits)
-    FIT_RATIO_PREF_MIN = 0.94 # preferred soft stretch limit
-    FIT_RATIO_PREF_MAX = 1.06 # preferred soft stretch limit
 
     def _speed_fit_segments(self, tts_data):
         """Speed-adjust each TTS segment to fit its time slot.
@@ -4604,7 +4120,7 @@ class Pipeline:
             CosyVoice 2 → Chatterbox Multilingual → ElevenLabs → XTTS v2 → Edge-TTS
         """
         target = self.cfg.target_language
-        is_english = target == "en" or target.startswith("en-")
+        is_english = target in ("en", "en-US", "en-GB")
 
         # ── English dubbing: zero-spend local stack ──────────────────────
         if is_english:
@@ -4835,6 +4351,75 @@ class Pipeline:
                      f"Hybrid TTS complete: {len(tts_data)} segments")
         return tts_data
 
+    def _tts_chatterbox(self, segments):
+        """Generate TTS using Chatterbox — free, local, human-like AI voice."""
+        import torch
+        import torchaudio
+        from chatterbox.tts import ChatterboxTTS
+
+        self._report("synthesize", 0.05, "Loading Chatterbox model on GPU...")
+        model = ChatterboxTTS.from_pretrained(device="cuda")
+
+        tts_data = []
+        try:
+            for i, seg in enumerate(segments):
+                text = self._prepare_tts_text(
+                    seg.get("text_translated", seg.get("text", "")).strip()
+                )
+                if not text:
+                    continue
+
+                wav_path = self.cfg.work_dir / f"tts_{i:04d}.wav"
+
+                try:
+                    wav_tensor = model.generate(text)
+                    # Save as WAV — Chatterbox outputs at 24kHz
+                    torchaudio.save(str(wav_path), wav_tensor.cpu(), model.sr)
+
+                    # Resample to our pipeline's sample rate
+                    if model.sr != self.SAMPLE_RATE:
+                        resampled = self.cfg.work_dir / f"tts_{i:04d}_rs.wav"
+                        subprocess.run(
+                            [self._ffmpeg, "-y", "-i", str(wav_path),
+                             "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                             str(resampled)],
+                            check=True, capture_output=True,
+                        )
+                        wav_path.unlink(missing_ok=True)
+                        resampled.rename(wav_path)
+                    self._enhance_tts_wav(wav_path)
+                    # QC gate
+                    expected_dur = seg.get("end", 0) - seg.get("start", 0)
+                    qc = self._qc_check_wav(wav_path, expected_duration=expected_dur)
+                    if not qc["ok"]:
+                        print(f"[QC/Chatterbox] Seg {i} issues: {'; '.join(qc['issues'])}", flush=True)
+
+                except Exception as e:
+                    self._report("synthesize", 0.1 + 0.8 * ((i + 1) / len(segments)),
+                                 f"Chatterbox error on seg {i+1}: {e}, skipping...")
+                    continue
+
+                if not wav_path.exists() or wav_path.stat().st_size == 0:
+                    continue
+
+                tts_dur = self._get_duration(wav_path)
+                tts_data.append({
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "wav": wav_path,
+                    "duration": tts_dur,
+                })
+                self._report(
+                    "synthesize",
+                    0.1 + 0.8 * ((i + 1) / len(segments)),
+                    f"Synthesized {i + 1}/{len(segments)} segments (Chatterbox)...",
+                )
+        finally:
+            del model
+            torch.cuda.empty_cache()
+
+        return tts_data
+
     def _tts_chatterbox_turbo(self, segments):
         """Generate TTS using Chatterbox-Turbo — 350M English-focused model.
 
@@ -4849,13 +4434,10 @@ class Pipeline:
         model = ChatterboxTurboTTS.from_pretrained(device="cuda")
 
         # Prepare voice reference from original audio (needs >5s)
-        try:
-            ref_wav = self._get_voice_ref(min_duration=6, sample_rate=24000)
-            if ref_wav:
-                self._report("synthesize", 0.06, "Cloning voice from original audio...")
-                model.prepare_conditionals(str(ref_wav))
-        except Exception as e:
-            print(f"[CB-Turbo] Voice cloning setup failed ({e}), using built-in voice", flush=True)
+        ref_wav = self._get_voice_ref(min_duration=6, sample_rate=24000)
+        if ref_wav:
+            self._report("synthesize", 0.06, "Cloning voice from original audio...")
+            model.prepare_conditionals(str(ref_wav))
 
         tts_data = []
         try:
@@ -4911,8 +4493,7 @@ class Pipeline:
                     f"Synthesized {i + 1}/{len(segments)} segments (CB-Turbo)...",
                 )
         finally:
-            if model is not None:
-                del model
+            del model
             torch.cuda.empty_cache()
 
         return tts_data
@@ -4927,19 +4508,16 @@ class Pipeline:
         import torchaudio
         from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
-        target = self.cfg.target_language.split("-")[0].lower()  # "en-US" → "en", "Hi" → "hi"
+        target = self.cfg.target_language.split("-")[0]  # "en-US" → "en"
 
         self._report("synthesize", 0.05, "Loading Chatterbox Multilingual on GPU...")
         model = ChatterboxMultilingualTTS.from_pretrained(device="cuda")
 
         # Prepare voice reference from original audio
-        try:
-            ref_wav = self._get_voice_ref(min_duration=6, sample_rate=24000)
-            if ref_wav:
-                self._report("synthesize", 0.06, "Cloning voice from original audio...")
-                model.prepare_conditionals(str(ref_wav))
-        except Exception as e:
-            print(f"[CB-MTL] Voice cloning setup failed ({e}), using built-in voice", flush=True)
+        ref_wav = self._get_voice_ref(min_duration=6, sample_rate=24000)
+        if ref_wav:
+            self._report("synthesize", 0.06, "Cloning voice from original audio...")
+            model.prepare_conditionals(str(ref_wav))
 
         tts_data = []
         try:
@@ -4995,8 +4573,7 @@ class Pipeline:
                     f"Synthesized {i + 1}/{len(segments)} segments (CB-Multilingual)...",
                 )
         finally:
-            if model is not None:
-                del model
+            del model
             torch.cuda.empty_cache()
 
         return tts_data
@@ -5008,7 +4585,7 @@ class Pipeline:
         or None if no audio is available.
         """
         ref_wav = self.cfg.work_dir / f"voice_ref_{sample_rate}.wav"
-        if ref_wav.exists():
+        if ref_wav.exists() and ref_wav.stat().st_size > 0:
             return ref_wav
 
         # Check for user-provided reference first
@@ -5016,26 +4593,32 @@ class Pipeline:
         if user_ref.exists():
             ref_files = list(user_ref.glob("*.wav")) + list(user_ref.glob("*.mp3"))
             if ref_files:
-                # Convert to correct sample rate
-                subprocess.run(
-                    [self._ffmpeg, "-y", "-i", str(ref_files[0]),
-                     "-t", "15", "-ar", str(sample_rate), "-ac", "1",
-                     str(ref_wav)],
-                    check=True, capture_output=True,
-                )
-                return ref_wav
+                try:
+                    subprocess.run(
+                        [self._ffmpeg, "-y", "-i", str(ref_files[0]),
+                         "-t", "15", "-ar", str(sample_rate), "-ac", "1",
+                         str(ref_wav)],
+                        check=True, capture_output=True,
+                    )
+                    if ref_wav.exists() and ref_wav.stat().st_size > 0:
+                        return ref_wav
+                except Exception:
+                    pass  # Fall through to extract from original audio
 
         # Extract from original audio
         audio_raw = self.cfg.work_dir / "audio_raw.wav"
         if audio_raw.exists():
-            subprocess.run(
-                [self._ffmpeg, "-y", "-i", str(audio_raw),
-                 "-t", "15", "-ar", str(sample_rate), "-ac", "1",
-                 str(ref_wav)],
-                check=True, capture_output=True,
-            )
-            if ref_wav.exists() and ref_wav.stat().st_size > 0:
-                return ref_wav
+            try:
+                subprocess.run(
+                    [self._ffmpeg, "-y", "-i", str(audio_raw),
+                     "-t", "15", "-ar", str(sample_rate), "-ac", "1",
+                     str(ref_wav)],
+                    check=True, capture_output=True,
+                )
+                if ref_wav.exists() and ref_wav.stat().st_size > 0:
+                    return ref_wav
+            except Exception:
+                pass
 
         return None
 
@@ -5482,25 +5065,14 @@ class Pipeline:
         return tts_data
 
     async def _edge_tts_single(self, text, mp3_path, voice=None, rate=None):
-        """Generate a single segment with edge-tts (results cached by text+voice+rate)."""
+        """Generate a single segment with edge-tts."""
         import edge_tts
-        _voice = voice or self.cfg.tts_voice
-        _rate  = rate  or self.cfg.tts_rate
-
-        # Check TTS cache
-        cached_bytes = _cache.get_tts(text, _voice, _rate, "edge_tts")
-        if cached_bytes is not None:
-            Path(mp3_path).write_bytes(cached_bytes)
-            return
-
-        comm = edge_tts.Communicate(text, _voice, rate=_rate)
+        comm = edge_tts.Communicate(
+            text,
+            voice or self.cfg.tts_voice,
+            rate=rate or self.cfg.tts_rate,
+        )
         await comm.save(str(mp3_path))
-
-        # Store in cache
-        try:
-            _cache.put_tts(text, _voice, _rate, "edge_tts", Path(mp3_path).read_bytes())
-        except Exception:
-            pass
 
     # ── TTS text prep pass ────────────────────────────────────────────────
     def _prepare_tts_text(self, text: str) -> str:
@@ -5637,8 +5209,6 @@ class Pipeline:
 
                 if qc["ok"]:
                     # This attempt passed — use it
-                    # unlink destination first: Windows raises WinError 183 if target exists
-                    wav_out.unlink(missing_ok=True)
                     wav_tmp.rename(wav_out)
                     return qc
 
@@ -5651,7 +5221,6 @@ class Pipeline:
 
         # No attempt passed — keep last wav if it exists, else original stays
         if wav_tmp.exists():
-            wav_out.unlink(missing_ok=True)
             wav_tmp.rename(wav_out)
         mp3_tmp.unlink(missing_ok=True)
         if best_qc:
@@ -5774,7 +5343,6 @@ class Pipeline:
                 "wav": wav,
                 "duration": tts_dur,
                 "_order": i,
-                "_orig_seg_idx": i,   # original index into segments[] for review queue lookup
                 "_already_sped": True,
                 "_rerender_count": rerender_count,
                 "_manual_review": manual_review,
@@ -5789,35 +5357,16 @@ class Pipeline:
                 if result:
                     tts_data.append(result)
 
-        # Sort back to original order and collect metrics
+        # Sort back to original order and strip internal keys
         tts_data.sort(key=lambda x: x.get("_order", 0))
-        total_rerenders = 0
-        review_queue = []
+        total_rerenders = sum(t.pop("_rerender_count", 0) for t in tts_data)
+        manual_review_segs = sum(1 for t in tts_data if t.pop("_manual_review", False))
         for t in tts_data:
-            rc = t.pop("_rerender_count", 0)
-            mr = t.pop("_manual_review", False)
-            orig_idx = t.pop("_orig_seg_idx", None)
-            total_rerenders += rc
             t.pop("_order", None)
             t.pop("_qc_ok", None)
-            if mr:
-                # Look up original segment by its index (not zip position — some segments are empty/skipped)
-                orig_seg = segments[orig_idx] if orig_idx is not None and orig_idx < len(segments) else {}
-                review_queue.append({
-                    "segment_idx": orig_idx,
-                    "start": t.get("start", 0),
-                    "end": t.get("end", 0),
-                    "source_text": orig_seg.get("text", ""),
-                    "translated_text": orig_seg.get("text_translated", ""),
-                    "emotion": orig_seg.get("emotion", "neutral"),
-                    "rerender_count": rc,
-                    "issues": ["auto-rerender exhausted"],
-                })
-        if total_rerenders > 0 or review_queue:
-            print(f"[QC] Edge TTS: {total_rerenders} rerenders, "
-                  f"{len(review_queue)} for manual review", flush=True)
-        if review_queue:
-            self._save_manual_review_queue(review_queue)
+        if total_rerenders > 0:
+            print(f"[QC] Edge TTS: {total_rerenders} rerenders total, "
+                  f"{manual_review_segs} segments need manual review", flush=True)
         return tts_data
 
     def _build_fitted_audio(self, video_path, audio_raw, tts_data, total_video_duration):
@@ -5851,10 +5400,8 @@ class Pipeline:
                 continue
 
             ratio = tts_dur / original_dur  # > 1 = TTS is longer, need to speed up
-            gap_ms = abs(tts_dur - original_dur) * 1000
 
-            # Tier 1: within 80ms — accept as-is
-            if gap_ms <= self.FIT_PASS_MS:
+            if abs(ratio - 1.0) < 0.05:
                 fitted_segments.append({
                     "start": seg_start,
                     "wav": tts_wav,
@@ -5862,13 +5409,7 @@ class Pipeline:
                 })
                 continue
 
-            # Tier 2: 80–250ms — stretch within preferred limits
-            # Tier 3: >250ms — still stretch if within hard limits, but flag as needing rewrite
-            if gap_ms > self.FIT_REWRITE_MS and ratio > self.FIT_RATIO_PREF_MAX:
-                print(f"[FIT] Seg {idx}: gap {gap_ms:.0f}ms exceeds rewrite threshold "
-                      f"(ratio={ratio:.3f}) — stretching within hard limits", flush=True)
-
-            # Clamp ratio to hard limits
+            # Clamp ratio: slow down max 1.1x, speed up max 1.25x
             clamped_ratio = max(self.SPEED_MIN, min(ratio, self.SPEED_MAX))
 
             stretched_wav = self.cfg.work_dir / f"fitted_{idx:04d}.wav"
@@ -6284,13 +5825,7 @@ class Pipeline:
                 "-i", str(tts),
                 "-i", str(bg_track),
                 "-filter_complex",
-                (
-                    f"[0:a]asplit=2[tts_out][tts_sc];"
-                    f"[1:a]volume={original_vol}[bg_raw];"
-                    f"[bg_raw][tts_sc]sidechaincompress="
-                    f"threshold=0.02:ratio=3:attack=20:release=300:makeup=1[bg_duck];"
-                    f"[tts_out][bg_duck]amix=inputs=2:duration=first:dropout_transition=2[out]"
-                ),
+                f"[1:a]volume={original_vol}[orig];[0:a][orig]amix=inputs=2:duration=first:dropout_transition=2[out]",
                 "-map", "[out]",
                 "-ar", str(self.SAMPLE_RATE),
                 "-ac", str(self.N_CHANNELS),
@@ -6365,14 +5900,7 @@ class Pipeline:
                  "-i", str(dubbed_audio),
                  "-i", str(bg_track),
                  "-filter_complex",
-                 (
-                     f"[0:a]asplit=2[dub_out][dub_sc];"
-                     f"[1:a]volume={vol}[bg_raw];"
-                     f"[bg_raw][dub_sc]sidechaincompress="
-                     f"threshold=0.02:ratio=3:attack=20:release=300:makeup=1[bg_duck];"
-                     f"[dub_out][bg_duck]amix=inputs=2:duration=longest[out]"
-                 ),
-                 "-map", "[out]",
+                 f"[1:a]volume={vol}[bg];[0:a][bg]amix=inputs=2:duration=longest",
                  "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
                  str(mixed_audio)],
                 check=True, capture_output=True,
@@ -6403,9 +5931,9 @@ class Pipeline:
                         "silenceremove=start_periods=1:start_silence=0.03:start_threshold=-50dB"
                         ":stop_periods=-1:stop_silence=0.03:stop_threshold=-50dB,"
                         "afade=t=in:st=0:d=0.01,"
+                        "afade=t=out:d=0.01,"
                         "speechnorm=e=50:r=0.0001:l=1,"
-                        "acompressor=threshold=-20dB:ratio=3:attack=5:release=50:makeup=2,"
-                        "areverse,afade=t=in:st=0:d=0.01,areverse"
+                        "acompressor=threshold=-20dB:ratio=3:attack=5:release=50:makeup=2"
                     ),
                     "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
                     str(enhanced),
@@ -6476,36 +6004,7 @@ class Pipeline:
             issues.append(f"QC read error: {e}")
 
         result["ok"] = len(issues) == 0
-        if len(issues) == 0:
-            result["qc_status"] = "pass"
-        elif any("manual_review" in str(i).lower() for i in issues):
-            result["qc_status"] = "manual_review"
-        elif len(issues) == 1 and "duration" in issues[0].lower():
-            result["qc_status"] = "pass_with_warning"
-        else:
-            result["qc_status"] = "rerender"
         return result
-
-    def _save_manual_review_queue(self, review_items: list):
-        """Persist segments that need manual review to a JSON file in the job output.
-
-        Saved to: {work_dir}/../manual_review_queue.json (next to dubbed.mp4)
-        Each item: {segment_idx, start, end, source_text, translated_text,
-                    emotion, issues, rerender_count}
-        """
-        if not self.cfg.enable_manual_review or not review_items:
-            return
-        import json as _json
-        out_path = self.cfg.work_dir.parent / "manual_review_queue.json"
-        try:
-            existing = []
-            if out_path.exists():
-                existing = _json.loads(out_path.read_text(encoding="utf-8"))
-            existing.extend(review_items)
-            out_path.write_text(_json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"[ManualReview] {len(review_items)} segments saved → {out_path}", flush=True)
-        except Exception as e:
-            print(f"[ManualReview] Failed to save queue: {e}", flush=True)
 
     # ── Video muxing ─────────────────────────────────────────────────────
     def _mux_replace_audio(self, video_path: Path, audio_path: Path, output_path: Path):
@@ -6519,8 +6018,8 @@ class Pipeline:
                 "-c:v", "copy",
                 "-map", "0:v:0",
                 "-map", "1:a:0",
-                # EBU R128 loudness target: -16 LUFS (broadcast/web standard), -1.5 dB true peak
-                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                # EBU R128 loudness target: -14 LUFS (YouTube standard), -1.5 dB true peak
+                "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
                 "-c:a", "aac", "-b:a", self.cfg.audio_bitrate,
                 str(output_path),
             ],

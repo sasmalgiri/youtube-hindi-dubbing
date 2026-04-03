@@ -10,14 +10,19 @@ interface URLInputProps {
     onSubmit: (url: string) => void;
     onFileSubmit: (file: File) => void;
     onBatchSubmit?: (urls: string[]) => void;
-    onSrtSubmit?: (srtFile: File, videoSource: { url?: string; file?: File }) => void;
+    onSrtSubmit?: (srtFile: File, videoSource: { url?: string; file?: File }, needsTranslation?: boolean) => void;
+    onModeChange?: (mode: InputMode) => void;
     disabled?: boolean;
     url?: string;
     onUrlChange?: (url: string) => void;
     getPreset?: () => LinkPreset;
+    dubDuration?: number;
+    onDubDurationChange?: (val: number) => void;
 }
 
-export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtSubmit, disabled, url: controlledUrl, onUrlChange, getPreset }: URLInputProps) {
+export { type InputMode };
+
+export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtSubmit, onModeChange, disabled, url: controlledUrl, onUrlChange, getPreset, dubDuration = 0, onDubDurationChange }: URLInputProps) {
     const [mode, setMode] = useState<InputMode>('url');
     const [internalUrl, setInternalUrl] = useState('');
 
@@ -29,6 +34,7 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
     const [file, setFile] = useState<File | null>(null);
     const [dragOver, setDragOver] = useState(false);
     const [batchText, setBatchText] = useState('');
+    const [srtNeedsTranslation, setSrtNeedsTranslation] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     // SRT mode state
@@ -113,7 +119,7 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
             videoSource.file = srtVideoFile;
         }
         if (!videoSource.url && !videoSource.file) return;
-        onSrtSubmit?.(srtFile, videoSource);
+        onSrtSubmit?.(srtFile, videoSource, srtNeedsTranslation);
     }, [srtFile, srtVideoMode, srtVideoUrl, srtVideoFile, disabled, onSrtSubmit]);
 
     const srtVideoReady = srtVideoMode === 'url'
@@ -131,7 +137,7 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
             {/* Tab Switcher */}
             <div className="flex gap-1 p-1 rounded-xl bg-card/50 border border-border">
                 <button
-                    onClick={() => setMode('url')}
+                    onClick={() => { setMode('url'); onModeChange?.('url'); }}
                     className={`flex-1 py-2.5 px-4 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
                         mode === 'url'
                             ? 'bg-primary text-white shadow-sm'
@@ -145,7 +151,7 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
                     YouTube URL
                 </button>
                 <button
-                    onClick={() => setMode('upload')}
+                    onClick={() => { setMode('upload'); onModeChange?.('upload'); }}
                     className={`flex-1 py-2.5 px-4 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
                         mode === 'upload'
                             ? 'bg-primary text-white shadow-sm'
@@ -160,7 +166,7 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
                     Upload Video
                 </button>
                 <button
-                    onClick={() => setMode('batch')}
+                    onClick={() => { setMode('batch'); onModeChange?.('batch'); }}
                     className={`flex-1 py-2.5 px-4 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
                         mode === 'batch'
                             ? 'bg-primary text-white shadow-sm'
@@ -175,7 +181,7 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
                     Batch URLs
                 </button>
                 <button
-                    onClick={() => setMode('srt')}
+                    onClick={() => { setMode('srt'); onModeChange?.('srt'); }}
                     className={`flex-1 py-2.5 px-4 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
                         mode === 'srt'
                             ? 'bg-primary text-white shadow-sm'
@@ -423,13 +429,42 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
             {mode === 'srt' && (
                 <>
                     <div className="glass-card p-4 space-y-4">
-                        <p className="text-sm text-text-secondary">
-                            Upload a translated SRT file with a video source. Skips transcription &amp; translation — goes straight to voice synthesis.
-                        </p>
+                        {/* SRT Type Toggle */}
+                        <div className="flex rounded-lg overflow-hidden border border-border mb-2">
+                            <button
+                                type="button"
+                                onClick={() => setSrtNeedsTranslation(false)}
+                                className={`flex-1 px-3 py-2 text-xs font-medium transition-colors ${
+                                    !srtNeedsTranslation ? 'bg-primary text-white' : 'bg-white/5 text-text-muted hover:bg-white/10'
+                                }`}
+                            >
+                                Already Translated (Hindi SRT)
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setSrtNeedsTranslation(true)}
+                                className={`flex-1 px-3 py-2 text-xs font-medium transition-colors ${
+                                    srtNeedsTranslation ? 'bg-amber-500 text-white' : 'bg-white/5 text-text-muted hover:bg-white/10'
+                                }`}
+                            >
+                                English SRT (needs translation)
+                            </button>
+                        </div>
+
+                        <div className="flex items-center gap-2 p-2.5 rounded-lg bg-primary/10 border border-primary/20">
+                            <p className="text-xs text-primary-light">
+                                {srtNeedsTranslation
+                                    ? <><strong>Translate + TTS</strong> — Upload English SRT + video. Pipeline translates to Hindi, then synthesizes voice.</>
+                                    : <><strong>TTS Only</strong> — Upload translated Hindi SRT + video. Just voice synthesis + assembly.</>
+                                }
+                            </p>
+                        </div>
 
                         {/* SRT File Upload */}
                         <div>
-                            <label className="block text-xs font-medium text-text-muted mb-1.5">Translated SRT File</label>
+                            <label className="block text-xs font-medium text-text-muted mb-1.5">
+                                {srtNeedsTranslation ? 'English Source SRT File' : 'Translated SRT File'}
+                            </label>
                             <input
                                 ref={srtFileInputRef}
                                 type="file"
@@ -526,6 +561,35 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
                                 </>
                             )}
                         </div>
+                        {/* Dub Duration — inline in SRT mode */}
+                        <div>
+                            <label className="block text-xs font-medium text-text-muted mb-1.5">
+                                Dub Duration — how much of the video to dub
+                            </label>
+                            <div className="grid grid-cols-5 gap-1.5">
+                                {[
+                                    { value: 0, label: 'Full' },
+                                    { value: 30, label: '30m' },
+                                    { value: 60, label: '1 hr' },
+                                    { value: 120, label: '2 hr' },
+                                    { value: 180, label: '3 hr' },
+                                ].map((m) => (
+                                    <button
+                                        key={m.value}
+                                        type="button"
+                                        onClick={() => onDubDurationChange?.(m.value)}
+                                        className={`
+                                            py-1.5 rounded-lg text-xs font-medium transition-all border
+                                            ${dubDuration === m.value
+                                                ? 'bg-primary/20 border-primary text-primary-light'
+                                                : 'bg-white/5 border-white/10 text-text-muted hover:bg-white/10'}
+                                        `}
+                                    >
+                                        {m.label}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
                     </div>
 
                     <button
@@ -546,7 +610,7 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
                                     <path d="m5 8 6 4-6 4V8Z" />
                                     <path d="m13 8 6 4-6 4V8Z" />
                                 </svg>
-                                Start SRT Dubbing
+                                Start TTS Dubbing
                             </>
                         )}
                     </button>

@@ -29,6 +29,7 @@ export interface JobCreateRequest {
     original_volume?: number;
     use_cosyvoice?: boolean;
     use_chatterbox?: boolean;
+    use_indic_parler?: boolean;
     use_elevenlabs?: boolean;
     use_google_tts?: boolean;
     use_coqui_xtts?: boolean;
@@ -38,13 +39,21 @@ export interface JobCreateRequest {
     multi_speaker?: boolean;
     transcribe_only?: boolean;
     audio_priority?: boolean;
+    audio_untouchable?: boolean;
+    post_tts_level?: string;
     audio_bitrate?: string;
     encode_preset?: string;
     split_duration?: number;
+    dub_duration?: number;
     fast_assemble?: boolean;
     dub_chain?: string[];
     enable_manual_review?: boolean;
     use_whisperx?: boolean;
+    simplify_english?: boolean;
+    step_by_step?: boolean;
+    use_new_pipeline?: boolean;
+    pipeline_mode?: string;
+    srt_needs_translation?: boolean;
 }
 
 export interface JobConfig {
@@ -52,13 +61,15 @@ export interface JobConfig {
     translation_engine?: string;
     tts_engine?: string;
     audio_priority?: boolean;
+    audio_untouchable?: boolean;
+    post_tts_level?: string;
     audio_bitrate?: string;
     encode_preset?: string;
 }
 
 export interface JobStatus {
     id: string;
-    state: 'queued' | 'running' | 'done' | 'error' | 'waiting_for_srt';
+    state: 'queued' | 'running' | 'done' | 'error' | 'waiting_for_srt' | 'review_transcription' | 'review_translation';
     current_step: string;
     step_progress: number;
     overall_progress: number;
@@ -81,6 +92,7 @@ export interface TranscriptSegment {
     start: number;
     end: number;
     text: string;
+    text_original?: string;  // Original English before simplification
     text_translated: string;
 }
 
@@ -217,6 +229,33 @@ export async function deleteJob(id: string): Promise<void> {
     if (!res.ok) throw new Error('Failed to delete job');
 }
 
+export interface CompareResult {
+    engines: Record<string, Array<{ start: number; end: number; text: string; text_translated: string }>>;
+    segment_count: number;
+    available: Array<{ key: string; label: string }>;
+}
+
+export async function compareTranslations(id: string, engines: string[] = [], maxSegments: number = 10): Promise<CompareResult> {
+    const res = await fetch(`${API_BASE}/api/jobs/${id}/compare-translations`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...EXTRA_HEADERS },
+        body: JSON.stringify({ engines, max_segments: maxSegments }),
+    });
+    if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(text || 'Failed to compare translations');
+    }
+    return res.json();
+}
+
+export async function continueJob(id: string): Promise<void> {
+    const res = await fetch(`${API_BASE}/api/jobs/${id}/continue`, {
+        method: 'POST',
+        headers: { ...EXTRA_HEADERS },
+    });
+    if (!res.ok) throw new Error('Failed to continue job');
+}
+
 export function resultVideoUrl(id: string): string {
     return `${API_BASE}/api/jobs/${id}/result`;
 }
@@ -260,6 +299,7 @@ export interface LinkPreset {
     original_volume?: number;
     use_cosyvoice?: boolean;
     use_chatterbox?: boolean;
+    use_indic_parler?: boolean;
     use_elevenlabs?: boolean;
     use_google_tts?: boolean;
     use_coqui_xtts?: boolean;
@@ -269,13 +309,21 @@ export interface LinkPreset {
     multi_speaker?: boolean;
     transcribe_only?: boolean;
     audio_priority?: boolean;
+    audio_untouchable?: boolean;
+    post_tts_level?: string;
     audio_bitrate?: string;
     encode_preset?: string;
     split_duration?: number;
+    dub_duration?: number;
     fast_assemble?: boolean;
     dub_chain?: string[];
     enable_manual_review?: boolean;
     use_whisperx?: boolean;
+    simplify_english?: boolean;
+    step_by_step?: boolean;
+    use_new_pipeline?: boolean;
+    pipeline_mode?: string;
+    srt_needs_translation?: boolean;
 }
 
 export interface SavedLink {

@@ -74,9 +74,16 @@ export default function TranscriptViewer({ jobId, targetLanguage = 'hi' }: Trans
                         <span className="text-xs text-text-muted font-mono">
                             {formatTime(seg.start)}
                         </span>
-                        <p className="text-sm text-text-secondary">
-                            {seg.text}
-                        </p>
+                        <div className="text-sm text-text-secondary">
+                            {seg.text_original && seg.text_original !== seg.text ? (
+                                <>
+                                    <p className="text-text-muted line-through text-xs mb-1">{seg.text_original}</p>
+                                    <p>{seg.text}</p>
+                                </>
+                            ) : (
+                                <p>{seg.text}</p>
+                            )}
+                        </div>
                         <p className="text-sm text-text-primary">
                             {seg.text_translated}
                         </p>

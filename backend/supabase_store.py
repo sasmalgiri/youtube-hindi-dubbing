@@ -114,6 +114,7 @@ def _job_to_row(job: "Job") -> dict:
         "fast_assemble":     getattr(req, "fast_assemble", True)       if req else True,
         "multi_speaker":     getattr(req, "multi_speaker", False)      if req else False,
         "split_duration":    getattr(req, "split_duration", 0)         if req else 0,
+        "dub_duration":      getattr(req, "dub_duration", 0)           if req else 0,
 
         # Quality / chain
         "qa_score":          job.qa_score,

@@ -7,7 +7,7 @@ import { useJobProgress } from '@/hooks/useJobProgress';
 import ProgressPipeline from '@/components/ProgressPipeline';
 import VideoPlayer from '@/components/VideoPlayer';
 import TranscriptViewer from '@/components/TranscriptViewer';
-import { resultVideoUrl, originalVideoUrl, resultSrtUrl, sourceSrtUrl, uploadTranslatedSrt, deleteJob } from '@/lib/api';
+import { resultVideoUrl, originalVideoUrl, resultSrtUrl, sourceSrtUrl, uploadTranslatedSrt, deleteJob, continueJob } from '@/lib/api';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '';
 
@@ -42,10 +42,13 @@ export default function JobPage() {
         isComplete,
         isError,
         isWaitingForSrt,
+        isReviewing,
+        reviewStep,
         error,
         eta,
         restart,
     } = useJobProgress(jobId);
+    const [continuing, setContinuing] = useState(false);
 
     const handleSrtUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
@@ -148,7 +151,7 @@ export default function JobPage() {
                         {status.config.asr_model && (
                             <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-blue-500/10 text-blue-400 border border-blue-500/20">
                                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2" /></svg>
-                                Whisper {status.config.asr_model}
+                                {status.config.asr_model}
                             </span>
                         )}
                         {status.config.translation_engine && (
@@ -371,11 +374,47 @@ export default function JobPage() {
 
                         {/* Transcript */}
                         <TranscriptViewer jobId={jobId} targetLanguage={status?.target_language} />
+
+                    </div>
+                )}
+
+                {/* Step-by-step review panel */}
+                {isReviewing && (
+                    <div className="space-y-4">
+                        <div className="p-4 rounded-xl bg-yellow-400/10 border border-yellow-400/30">
+                            <div className="flex items-center justify-between mb-3">
+                                <h3 className="text-lg font-semibold text-yellow-400">
+                                    Review {reviewStep === 'transcription' ? 'Transcription' : 'Translation'}
+                                </h3>
+                                <button
+                                    type="button"
+                                    onClick={async () => {
+                                        setContinuing(true);
+                                        try {
+                                            await continueJob(jobId);
+                                        } catch {
+                                            alert('Failed to continue job');
+                                        }
+                                        setContinuing(false);
+                                    }}
+                                    disabled={continuing}
+                                    className="px-4 py-2 rounded-lg bg-primary text-white font-medium hover:bg-primary/80 transition-colors disabled:opacity-50"
+                                >
+                                    {continuing ? 'Continuing...' : `Continue to ${reviewStep === 'transcription' ? 'Translation' : 'TTS Synthesis'}`}
+                                </button>
+                            </div>
+                            <p className="text-sm text-text-muted mb-3">
+                                {reviewStep === 'transcription'
+                                    ? 'Review the transcribed text below. If it looks good, click Continue to proceed to translation.'
+                                    : 'Review the translated Hindi text below. If it looks good, click Continue to proceed to TTS synthesis.'}
+                            </p>
+                        </div>
+                        <TranscriptViewer jobId={jobId} targetLanguage={status?.target_language} />
                     </div>
                 )}
 
                 {/* Loading state */}
-                {!isComplete && !isError && !isWaitingForSrt && (
+                {!isComplete && !isError && !isWaitingForSrt && !isReviewing && (
                     <div className="text-center py-16">
                         <div className="inline-flex items-center gap-3 px-6 py-3 rounded-2xl bg-card border border-border">
                             <svg className="animate-spin text-primary" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">

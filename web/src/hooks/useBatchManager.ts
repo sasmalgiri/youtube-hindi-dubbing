@@ -43,6 +43,8 @@ export interface BatchSettings {
     use_coqui_xtts?: boolean;
     use_edge_tts?: boolean;
     audio_priority?: boolean;
+    audio_untouchable?: boolean;
+    post_tts_level?: string;
     audio_bitrate?: string;
     encode_preset?: string;
     prefer_youtube_subs?: boolean;
@@ -51,6 +53,7 @@ export interface BatchSettings {
     transcribe_only?: boolean;
     fast_assemble?: boolean;
     split_duration?: number;
+    dub_duration?: number;
     dub_chain?: string[];
     enable_manual_review?: boolean;
     use_whisperx?: boolean;
@@ -197,7 +200,7 @@ export function useBatchManager(): UseBatchManagerReturn {
         setItems((prev) => {
             const downloadedIds = new Set(triggered);
             return prev.map((item) =>
-                downloadedIds.has(item.jobId) ? { ...item, downloaded: true } : item
+                downloadedIds.has(item.jobId as string) ? { ...item, downloaded: true } : item
             );
         });
     }, [items, autoDownload, triggerDownload]);
@@ -245,6 +248,8 @@ export function useBatchManager(): UseBatchManagerReturn {
                     use_coqui_xtts: settings.use_coqui_xtts,
                     use_edge_tts: settings.use_edge_tts,
                     audio_priority: settings.audio_priority,
+                    audio_untouchable: settings.audio_untouchable,
+                    post_tts_level: settings.post_tts_level,
                     audio_bitrate: settings.audio_bitrate,
                     encode_preset: settings.encode_preset,
                     prefer_youtube_subs: settings.prefer_youtube_subs,
@@ -253,6 +258,7 @@ export function useBatchManager(): UseBatchManagerReturn {
                     transcribe_only: settings.transcribe_only,
                     fast_assemble: settings.fast_assemble,
                     split_duration: settings.split_duration,
+                    dub_duration: settings.dub_duration,
                     dub_chain: settings.dub_chain,
                     enable_manual_review: settings.enable_manual_review,
                     use_whisperx: settings.use_whisperx,

@@ -12,6 +12,8 @@ interface JobProgress {
     isComplete: boolean;
     isError: boolean;
     isWaitingForSrt: boolean;
+    isReviewing: boolean;
+    reviewStep: string;
     error: string | null;
     eta: string;
     restart: () => void;
@@ -35,6 +37,8 @@ export function useJobProgress(jobId: string | null): JobProgress {
     const [isComplete, setIsComplete] = useState(false);
     const [isError, setIsError] = useState(false);
     const [isWaitingForSrt, setIsWaitingForSrt] = useState(false);
+    const [isReviewing, setIsReviewing] = useState(false);
+    const [reviewStep, setReviewStep] = useState('');
     const [error, setError] = useState<string | null>(null);
     const [eta, setEta] = useState('');
     const unsubRef = useRef<(() => void) | null>(null);
@@ -90,6 +94,11 @@ export function useJobProgress(jobId: string | null): JobProgress {
                     setOverallProgress(0.4);
                     setEta('');
                     if (pollRef.current) clearInterval(pollRef.current);
+                } else if (job.state === 'review_transcription' || job.state === 'review_translation') {
+                    setIsReviewing(true);
+                    setReviewStep(job.state === 'review_transcription' ? 'transcription' : 'translation');
+                    setIsComplete(false);
+                    setIsError(false);
                 }
             } catch {
                 // Keep polling on transient errors
@@ -230,5 +239,5 @@ export function useJobProgress(jobId: string | null): JobProgress {
         unsubRef.current = unsub;
     }, [jobId, startPolling, updateEta]);
 
-    return { status, step, stepProgress, overallProgress, message, isComplete, isError, isWaitingForSrt, error, eta, restart };
+    return { status, step, stepProgress, overallProgress, message, isComplete, isError, isWaitingForSrt, isReviewing, reviewStep, error, eta, restart };
 }

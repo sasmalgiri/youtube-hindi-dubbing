@@ -21,7 +21,8 @@ export default function HomePage() {
         mix_original: false,
         original_volume: 0.10,
         use_cosyvoice: true,
-        use_chatterbox: false,
+        use_chatterbox: true,
+        use_indic_parler: false,
         use_elevenlabs: false,
         use_google_tts: false,
         use_coqui_xtts: false,
@@ -31,13 +32,21 @@ export default function HomePage() {
         multi_speaker: false,
         transcribe_only: false,
         audio_priority: true,
+        audio_untouchable: false,
+        post_tts_level: 'full',
         audio_bitrate: '320k',
-        encode_preset: 'medium',
+        encode_preset: 'veryfast',
         split_duration: 0,
+        dub_duration: 0,
         fast_assemble: false,
         dub_chain: [],
         enable_manual_review: true,
-        use_whisperx: false,
+        use_whisperx: true,
+        simplify_english: true,
+        step_by_step: false,
+        use_new_pipeline: false,
+        pipeline_mode: 'classic',
+        _input_mode: 'url',
     });
     const [currentUrl, setCurrentUrl] = useState('');
     const [submitting, setSubmitting] = useState(false);
@@ -112,7 +121,7 @@ export default function HomePage() {
         router.push('/batch');
     }, [sourceLanguage, targetLanguage, settings, router]);
 
-    const handleSrtSubmit = useCallback(async (srtFile: File, videoSource: { url?: string; file?: File }) => {
+    const handleSrtSubmit = useCallback(async (srtFile: File, videoSource: { url?: string; file?: File }, needsTranslation?: boolean) => {
         setSubmitting(true);
         setError(null);
         try {
@@ -120,6 +129,9 @@ export default function HomePage() {
                 source_language: sourceLanguage,
                 target_language: targetLanguage,
                 ...settings,
+                audio_untouchable: !needsTranslation,  // Only lock audio when already translated
+                post_tts_level: needsTranslation ? 'full' : 'none',
+                srt_needs_translation: needsTranslation || false,
             }, videoSource);
             router.push(`/jobs/${id}`);
         } catch (e) {
@@ -144,7 +156,7 @@ export default function HomePage() {
                     </div>
 
                     {/* URL Input */}
-                    <URLInput onSubmit={handleSubmit} onFileSubmit={handleFileSubmit} onBatchSubmit={handleBatchSubmit} onSrtSubmit={handleSrtSubmit} disabled={submitting} url={currentUrl} onUrlChange={setCurrentUrl} getPreset={() => ({ source_language: sourceLanguage, target_language: targetLanguage, ...settings })} />
+                    <URLInput onSubmit={handleSubmit} onFileSubmit={handleFileSubmit} onBatchSubmit={handleBatchSubmit} onSrtSubmit={handleSrtSubmit} onModeChange={(m) => setSettings(s => ({ ...s, _input_mode: m }))} disabled={submitting} url={currentUrl} onUrlChange={setCurrentUrl} getPreset={() => ({ source_language: sourceLanguage, target_language: targetLanguage, ...settings })} dubDuration={settings.dub_duration} onDubDurationChange={(v) => setSettings(s => ({ ...s, dub_duration: v }))} />
 
                     {/* Saved Links */}
                     <div className="mt-4">
@@ -170,6 +182,40 @@ export default function HomePage() {
                         onTargetChange={setTargetLanguage}
                     />
                 </div>
+
+                {/* Pipeline Switcher — 4 modes (hidden in SRT mode — only Classic applies) */}
+                {settings._input_mode !== 'srt' && (
+                <div className="flex items-center gap-3 px-1">
+                    <div className="flex rounded-xl overflow-hidden border border-border">
+                        {[
+                            { mode: 'classic', label: 'Classic', color: 'bg-primary' },
+                            { mode: 'hybrid', label: 'Hybrid', color: 'bg-amber-500' },
+                            { mode: 'new', label: 'New (DP)', color: 'bg-green-500' },
+                            { mode: 'oneflow', label: 'OneFlow', color: 'bg-red-500' },
+                        ].map(({ mode, label, color }) => (
+                            <button
+                                key={mode}
+                                type="button"
+                                onClick={() => setSettings(s => ({ ...s, pipeline_mode: mode, use_new_pipeline: mode === 'new' }))}
+                                className={`px-4 py-2 text-xs font-medium transition-colors ${
+                                    settings.pipeline_mode === mode || (!(settings.pipeline_mode) && mode === 'classic')
+                                        ? `${color} text-white`
+                                        : 'bg-white/5 text-text-muted hover:bg-white/10'
+                                }`}
+                            >
+                                {label}
+                            </button>
+                        ))}
+                    </div>
+                    <span className="text-[10px] text-text-muted">
+                        {(({ classic: 'Whisper + merge/split + rule engine (proven)',
+                           hybrid: 'Old shell + new DP core (best of both)',
+                           new: 'Parakeet + WhisperX + DP cues + glossary (experimental)',
+                           oneflow: 'Groq Whisper → Google Translate → Edge-TTS → 1.15x (FASTEST)',
+                        }) as Record<string, string>)[settings.pipeline_mode || 'classic']}
+                    </span>
+                </div>
+                )}
 
                 {/* Advanced Settings */}
                 <SettingsPanel settings={settings} onChange={setSettings} />

@@ -6,6 +6,9 @@ FastAPI server with SSE progress, YouTube URL input, and translation support.
 from __future__ import annotations
 
 import os
+# Fix Windows console encoding for Hindi/Devanagari text
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
 from pathlib import Path as _Path
 # Load .env file for GEMINI_API_KEY etc.
 _env_file = _Path(__file__).resolve().parent / ".env"
@@ -93,7 +96,7 @@ def _send_training_data(source_srt_path: Path, translated_srt_path: Path, source
 
 # ── Types ────────────────────────────────────────────────────────────────────
 
-JobState = Literal["queued", "running", "done", "error", "waiting_for_srt"]
+JobState = Literal["queued", "running", "done", "error", "waiting_for_srt", "review_transcription", "review_translation"]
 
 
 @dataclass
@@ -120,6 +123,8 @@ class Job:
     chain_languages: List[str] = field(default_factory=list)  # Remaining languages in chain
     chain_parent_id: Optional[str] = None  # Parent job ID in chain
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    pause_event: threading.Event = field(default_factory=threading.Event)
+    pipeline_ref: Optional[Any] = None  # Reference to Pipeline for step-by-step state
 
 
 class JobCreateRequest(BaseModel):
@@ -134,6 +139,7 @@ class JobCreateRequest(BaseModel):
     original_volume: float = 0.10
     use_cosyvoice: bool = True
     use_chatterbox: bool = False
+    use_indic_parler: bool = False
     use_elevenlabs: bool = False
     use_google_tts: bool = False
     use_coqui_xtts: bool = False
@@ -143,13 +149,21 @@ class JobCreateRequest(BaseModel):
     multi_speaker: bool = False
     transcribe_only: bool = False
     audio_priority: bool = True
+    audio_untouchable: bool = False  # TTS output is NEVER modified — no trim, no norm, no speed change
+    post_tts_level: str = "full"    # "full" | "minimal" | "none"
     audio_bitrate: str = "192k"
     encode_preset: str = "veryfast"
     split_duration: int = 0     # 0 = no split, 30/40 = split every N minutes
+    dub_duration: int = 0       # 0 = full video, 60/120 = dub only first N minutes
     fast_assemble: bool = True  # True = instant in-memory, False = ffmpeg (preserves overlaps)
     dub_chain: List[str] = []  # e.g. ["en", "hi"] — dub through languages sequentially
     enable_manual_review: bool = True  # Save manual_review_queue.json for failed segments
     use_whisperx: bool = False         # WhisperX forced alignment for tighter word timestamps
+    simplify_english: bool = True      # Simplify complex English before translation for better Hindi
+    step_by_step: bool = False         # Pause after transcription & translation for review
+    use_new_pipeline: bool = False     # Use new modular pipeline (experimental)
+    pipeline_mode: str = "classic"     # "classic" | "hybrid" | "new"
+    srt_needs_translation: bool = False  # True = English SRT needs translation before TTS
 
     @validator("target_language", "source_language")
     def validate_language(cls, v):
@@ -430,6 +444,16 @@ def _make_progress_callback(job: Job):
         job.step_progress = progress
         job.overall_progress = _calc_overall(step, progress)
         job.message = message
+
+        # Update job state for step-by-step pauses
+        if job.pipeline_ref and job.pipeline_ref.paused_at:
+            if job.pipeline_ref.paused_at == "review_transcription":
+                job.state = "review_transcription"
+                job.segments = job.pipeline_ref.segments  # Expose segments for review
+            elif job.pipeline_ref.paused_at == "review_translation":
+                job.state = "review_translation"
+                job.segments = job.pipeline_ref.segments
+
         job.events.append({
             "step": step,
             "progress": round(progress, 3),
@@ -483,6 +507,7 @@ def _run_job(job: Job, req: JobCreateRequest):
             mix_original=req.mix_original,
             original_volume=req.original_volume,
             use_cosyvoice=req.use_cosyvoice, use_chatterbox=req.use_chatterbox,
+            use_indic_parler=getattr(req, 'use_indic_parler', False),
             use_elevenlabs=req.use_elevenlabs,
             use_google_tts=req.use_google_tts,
             use_coqui_xtts=req.use_coqui_xtts,
@@ -492,12 +517,17 @@ def _run_job(job: Job, req: JobCreateRequest):
             multi_speaker=req.multi_speaker,
             transcribe_only=req.transcribe_only,
             audio_priority=req.audio_priority,
+            audio_untouchable=getattr(req, 'audio_untouchable', False),
+            post_tts_level=getattr(req, 'post_tts_level', 'full'),
             audio_bitrate=req.audio_bitrate,
             encode_preset=req.encode_preset,
             split_duration=req.split_duration,
+            dub_duration=getattr(req, 'dub_duration', 0),
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
             use_whisperx=req.use_whisperx,
+            simplify_english=getattr(req, 'simplify_english', True),
+            step_by_step=getattr(req, 'step_by_step', False),
         )
 
         get_metrics().record_job_start(job.id, req.url, {
@@ -513,13 +543,206 @@ def _run_job(job: Job, req: JobCreateRequest):
             "translation_engine": req.translation_engine,
         })
 
-        pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job),
-                            cancel_check=job.cancel_event.is_set)
-        pipeline.run()
+        pipeline_mode = getattr(req, 'pipeline_mode', 'classic')
+        progress_cb = _make_progress_callback(job)
 
-        job.video_title = pipeline.video_title or "Untitled"
-        job.segments = pipeline.segments
-        job.qa_score = pipeline.qa_score
+        # ── Enforce mode constraints on backend ──
+        if pipeline_mode == "oneflow":
+            # ═══ ONEFLOW: Groq → Google → Edge-TTS → 1.15x → video adapts ═══
+            from dubbing.oneflow import run_oneflow
+            try:
+                run_oneflow(
+                    source_url=req.url,
+                    work_dir=OUTPUTS / job.id / "work",
+                    output_path=out_path,
+                    target_language=req.target_language,
+                    tts_voice=req.voice,
+                    tts_rate=req.tts_rate,
+                    audio_bitrate=req.audio_bitrate,
+                    on_progress=progress_cb,
+                    cancel_check=job.cancel_event.is_set,
+                )
+                job.result_path = out_path
+                job.video_title = req.url.split("/")[-1]
+            except Exception as e:
+                raise RuntimeError(f"OneFlow failed: {e}")
+            # Skip all other pipeline paths
+            job.segments = []
+
+        elif pipeline_mode == "new":
+            # Force Parakeet ASR, disable incompatible options
+            req.asr_model = "parakeet"
+            req.prefer_youtube_subs = False
+            req.use_yt_translate = False
+            req.transcribe_only = False
+            req.multi_speaker = False
+            req.step_by_step = False
+            req.simplify_english = False
+            req.dub_chain = []
+        elif pipeline_mode == "hybrid":
+            # Hybrid keeps old ASR + translation, but disables old simplify (DP cues replace it)
+            req.simplify_english = False
+
+        if pipeline_mode == "new":
+            # ═══ NEW MODULAR PIPELINE ═══
+            # Everything new: Parakeet + WhisperX + DP cues + glossary
+            # Old shell only for download + TTS + assembly
+            from dubbing.runner import DubbingRunner
+            runner = DubbingRunner(
+                work_dir=OUTPUTS / job.id / "work",
+                source_lang=req.source_language if req.source_language != "auto" else "en",
+                target_lang=req.target_language,
+                on_progress=progress_cb,
+            )
+            pipeline = Pipeline(cfg, on_progress=progress_cb,
+                                cancel_check=job.cancel_event.is_set)
+            job.pipeline_ref = pipeline
+
+            # Download + Extract (old shell)
+            pipeline.download_and_extract()
+            wav_path = OUTPUTS / job.id / "work" / "audio_raw.wav"
+
+            # ASR → cues → translate → fit (new core)
+            glossary_path = OUTPUTS / job.id / "work" / "glossary.json"
+            use_parakeet = (req.asr_model == "parakeet")
+
+            def translate_fn(text, hints):
+                segs = [{"text": text, "start": 0, "end": hints.get("duration_ms", 3000) / 1000}]
+                pipeline._translate_segments(segs)
+                return segs[0].get("text_translated", text)
+
+            segments = runner.run_full(wav_path, translate_fn=translate_fn,
+                                       glossary_path=glossary_path, use_parakeet=use_parakeet)
+            runner.export_srt(OUTPUTS / job.id / "work" / f"transcript_{req.target_language}.srt")
+            runner.export_source_srt(OUTPUTS / job.id / "work" / "transcript_source.srt")
+
+            # TTS + assembly (old shell)
+            pipeline.segments = segments
+            pipeline._run_tts_and_assembly(segments, wav_path)
+
+        elif pipeline_mode == "hybrid":
+            # ═══ HYBRID: Old shell + new core ═══
+            # Old: download, extract, ASR (Whisper), TTS, assembly, retry, fallbacks
+            # New: DP cue building, glossary, Hindi fitting, QC gates
+            # Best of both: proven infrastructure + quality-critical intelligence
+            from dubbing.runner import DubbingRunner
+            from dubbing import glossary, glossary_builder, cue_builder, qc, fit_hi, format_hi, tts_bridge
+            from dubbing.asr_runner import normalize_words
+            from dubbing.contracts import Word
+
+            pipeline = Pipeline(cfg, on_progress=progress_cb,
+                                cancel_check=job.cancel_event.is_set,
+                                pause_event=job.pause_event if req.step_by_step else None)
+            job.pipeline_ref = pipeline
+
+            # Step 1-2: Download + Extract (old shell — proven)
+            pipeline.download_and_extract()
+
+            # Step 3: ASR (old shell — Whisper/YouTube subs, all options work)
+            pipeline._run_transcription()
+
+            # ─── NEW CORE TAKES OVER ───
+            # Convert old segments to Word objects
+            words = []
+            for seg in pipeline.segments:
+                if seg.get("words"):
+                    for w in seg["words"]:
+                        words.append(Word(
+                            text=w.get("word", w.get("text", "")),
+                            start=w.get("start", 0), end=w.get("end", 0),
+                            source="whisper",
+                        ))
+                else:
+                    for word_text in seg.get("text", "").split():
+                        words.append(Word(
+                            text=word_text,
+                            start=seg.get("start", 0), end=seg.get("end", 0),
+                            source="whisper",
+                        ))
+            words = normalize_words(words)
+
+            # Glossary
+            glossary_path = OUTPUTS / job.id / "work" / "glossary.json"
+            if glossary_path.exists():
+                terms = glossary.load_glossary(glossary_path)
+            else:
+                terms = glossary_builder.extract_terms_from_words(words)
+                glossary_builder.save_glossary(terms, glossary_path)
+
+            progress_cb("transcribe", 0.75, f"Glossary: {len(terms)} terms")
+
+            # Tag words + DP cue build
+            words = glossary.tag_words(words, terms)
+            progress_cb("transcribe", 0.8, "Building DP cues...")
+            cues = cue_builder.build_cues(words)
+            cues = glossary.tag_cues(cues, terms)
+            cues = qc.english_qc(cues)
+            issues = qc.count_issues(cues)
+            progress_cb("transcribe", 0.9,
+                        f"DP cues: {len(cues)} | QC: {issues['pass_rate']:.0%} pass")
+
+            # Convert cues back to pipeline segments for translation
+            text_segments = []
+            for cue in cues:
+                text_segments.append({
+                    "start": cue.start, "end": cue.end,
+                    "text": cue.text_clean_en,
+                    "text_original": cue.text_original,
+                    "speaker_id": cue.speaker,
+                    "_protected_terms": cue.protected_terms,
+                })
+
+            pipeline.segments = text_segments
+
+            # Step 4: Translate (old shell — all 12+ engines, proven)
+            progress_cb("translate", 0.0, "Translating with old engine...")
+            pipeline._translate_segments(text_segments)
+            pipeline.segments = text_segments
+
+            # ─── NEW CORE: Hindi fitting + QC ───
+            # BUG FIX: cues and text_segments may have different lengths
+            # Use index-based iteration, not zip()
+            n_match = min(len(cues), len(text_segments))
+            for i in range(n_match):
+                cues[i].text_hi_raw = text_segments[i].get("text_translated", "")
+                cues[i].text_clean_en = text_segments[i].get("text", "")  # FIX: was text_en_clean (typo)
+
+            cues = fit_hi.fit_cues(cues, terms)
+            cues = glossary.validate_hindi(cues, terms)
+            cues = format_hi.format_cues(cues)
+            cues = qc.pre_tts_qc(cues)
+
+            pre_issues = qc.count_issues(cues)
+            progress_cb("translate", 0.95,
+                        f"Hindi fit + QC: {pre_issues['pass_rate']:.0%} pass")
+
+            # Write fitted Hindi back to pipeline segments (index-based, not zip)
+            for i in range(n_match):
+                text_segments[i]["text_translated"] = cues[i].text_hi_fit or cues[i].text_hi_raw
+
+            # Export debug artifacts
+            tts_bridge.export_json(cues, OUTPUTS / job.id / "work" / "cues_debug.json")
+            tts_bridge.export_csv(cues, OUTPUTS / job.id / "work" / "cues_elevenlabs.csv")
+
+            # Step 5-6: TTS + Assembly (old shell — proven, all engines)
+            audio_raw_path = OUTPUTS / job.id / "work" / "audio_raw.wav"
+            if not audio_raw_path.exists():
+                raise RuntimeError(f"audio_raw.wav not found: {audio_raw_path}")
+            pipeline._run_tts_and_assembly(text_segments, audio_raw_path)
+
+        else:
+            # ═══ CLASSIC MONOLITH PIPELINE ═══
+            pipeline = Pipeline(cfg, on_progress=progress_cb,
+                                cancel_check=job.cancel_event.is_set,
+                                pause_event=job.pause_event if req.step_by_step else None)
+            job.pipeline_ref = pipeline
+            pipeline.run()
+
+        # OneFlow sets its own job data — skip pipeline access
+        if pipeline_mode != "oneflow":
+            job.video_title = pipeline.video_title or "Untitled"
+            job.segments = pipeline.segments
+            job.qa_score = pipeline.qa_score
 
         if req.transcribe_only:
             job.overall_progress = 1.0
@@ -590,7 +813,8 @@ def _run_job(job: Job, req: JobCreateRequest):
 
         # Record job metrics to Supabase (fire-and-forget)
         _render_time = time.time() - _t_start
-        _segs = (pipeline.segments if pipeline else None) or []
+        _pipeline_exists = pipeline_mode != "oneflow" and 'pipeline' in locals()
+        _segs = (pipeline.segments if _pipeline_exists else job.segments) or []
         # Read manual review queue to count segments that needed review
         _mrq_path = OUTPUTS / job.id / "manual_review_queue.json"
         _mrq_path_saved = Path(job.saved_folder) / "manual_review_queue.json" if job.saved_folder else None
@@ -710,10 +934,15 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             use_google_tts=req.use_google_tts, use_coqui_xtts=req.use_coqui_xtts,
             use_edge_tts=req.use_edge_tts, prefer_youtube_subs=False,
             multi_speaker=req.multi_speaker, audio_priority=req.audio_priority,
+            audio_untouchable=getattr(req, 'audio_untouchable', False),
+            post_tts_level=getattr(req, 'post_tts_level', 'full'),
             audio_bitrate=req.audio_bitrate, encode_preset=req.encode_preset,
+            dub_duration=getattr(req, 'dub_duration', 0),
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
             use_whisperx=req.use_whisperx,
+            simplify_english=getattr(req, 'simplify_english', True),
+            step_by_step=getattr(req, 'step_by_step', False),
         )
         p = Pipeline(cfg, on_progress=callback, cancel_check=job.cancel_event.is_set)
         p.video_title = job.video_title
@@ -787,6 +1016,7 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             mix_original=req.mix_original,
             original_volume=req.original_volume,
             use_cosyvoice=req.use_cosyvoice, use_chatterbox=req.use_chatterbox,
+            use_indic_parler=getattr(req, 'use_indic_parler', False),
             use_elevenlabs=req.use_elevenlabs,
             use_google_tts=req.use_google_tts,
             use_coqui_xtts=req.use_coqui_xtts,
@@ -794,11 +1024,16 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             prefer_youtube_subs=False,
             multi_speaker=req.multi_speaker,
             audio_priority=req.audio_priority,
+            audio_untouchable=getattr(req, 'audio_untouchable', False),
+            post_tts_level=getattr(req, 'post_tts_level', 'full'),
             audio_bitrate=req.audio_bitrate,
             encode_preset=req.encode_preset,
+            dub_duration=getattr(req, 'dub_duration', 0),
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
             use_whisperx=req.use_whisperx,
+            simplify_english=getattr(req, 'simplify_english', True),
+            step_by_step=getattr(req, 'step_by_step', False),
         )
 
         pipeline = Pipeline(cfg, on_progress=_part_callback,
@@ -1035,6 +1270,7 @@ async def create_job_upload(
     original_volume: float = Form(0.10),
     use_cosyvoice: str = Form("true"),
     use_chatterbox: str = Form("false"),
+    use_indic_parler: str = Form("false"),
     use_elevenlabs: str = Form("false"),
     use_google_tts: str = Form("false"),
     use_coqui_xtts: str = Form("false"),
@@ -1044,12 +1280,17 @@ async def create_job_upload(
     multi_speaker: str = Form("false"),
     transcribe_only: str = Form("false"),
     audio_priority: str = Form("true"),
+    audio_untouchable: str = Form("false"),
+    post_tts_level: str = Form("full"),
     audio_bitrate: str = Form("192k"),
     encode_preset: str = Form("veryfast"),
     split_duration: int = Form(0),
+    dub_duration: int = Form(0),
     fast_assemble: str = Form("true"),
     enable_manual_review: str = Form("true"),
     use_whisperx: str = Form("false"),
+    simplify_english: str = Form("true"),
+    step_by_step: str = Form("false"),
     voice: str = Form("hi-IN-SwaraNeural"),
 ):
     """Create a dubbing job from an uploaded video file."""
@@ -1086,6 +1327,7 @@ async def create_job_upload(
             mix_original=_bool(mix_original),
             original_volume=original_volume,
             use_cosyvoice=_bool(use_cosyvoice), use_chatterbox=_bool(use_chatterbox),
+            use_indic_parler=_bool(use_indic_parler),
             use_elevenlabs=_bool(use_elevenlabs),
             use_google_tts=_bool(use_google_tts),
             use_coqui_xtts=_bool(use_coqui_xtts),
@@ -1095,12 +1337,18 @@ async def create_job_upload(
             multi_speaker=_bool(multi_speaker),
             transcribe_only=_bool(transcribe_only),
             audio_priority=_bool(audio_priority),
+            audio_untouchable=_bool(audio_untouchable),
+            post_tts_level=post_tts_level,
             audio_bitrate=audio_bitrate,
             encode_preset=encode_preset,
             split_duration=split_duration,
+            dub_duration=dub_duration,
             fast_assemble=_bool(fast_assemble),
             enable_manual_review=_bool(enable_manual_review),
             use_whisperx=_bool(use_whisperx),
+            simplify_english=_bool(simplify_english),
+            step_by_step=_bool(step_by_step),
+            srt_needs_translation=_bool(srt_needs_translation) if 'srt_needs_translation' in dir() else False,
         )
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -1147,17 +1395,23 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
             mix_original=req.mix_original,
             original_volume=req.original_volume,
             use_cosyvoice=req.use_cosyvoice, use_chatterbox=req.use_chatterbox,
+            use_indic_parler=getattr(req, 'use_indic_parler', False),
             use_elevenlabs=req.use_elevenlabs,
             use_google_tts=req.use_google_tts,
             use_coqui_xtts=req.use_coqui_xtts,
             use_edge_tts=req.use_edge_tts,
             multi_speaker=req.multi_speaker,
             audio_priority=req.audio_priority,
+            audio_untouchable=getattr(req, 'audio_untouchable', False),
+            post_tts_level=getattr(req, 'post_tts_level', 'full'),
             audio_bitrate=req.audio_bitrate,
             encode_preset=req.encode_preset,
+            dub_duration=getattr(req, 'dub_duration', 0),
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
             use_whisperx=req.use_whisperx,
+            simplify_english=getattr(req, 'simplify_english', True),
+            step_by_step=getattr(req, 'step_by_step', False),
         )
 
         pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job),
@@ -1168,8 +1422,14 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
 
         job.video_title = pipeline.video_title or "Untitled"
 
-        # Step 3-6: Skip transcribe/translate, run TTS + assembly from SRT
-        pipeline.run_from_srt(srt_path)
+        # Check if SRT needs translation (source English) or is already translated
+        srt_needs_translation = getattr(req, 'srt_needs_translation', False)
+        if srt_needs_translation:
+            # English SRT → translate → TTS → assembly
+            pipeline.run_from_source_srt(srt_path)
+        else:
+            # Already translated SRT → TTS + assembly only
+            pipeline.run_from_srt(srt_path)
 
         if not out_path.exists():
             raise RuntimeError("Pipeline finished but output file not found")
@@ -1247,6 +1507,7 @@ async def create_job_with_srt(
     original_volume: float = Form(0.10),
     use_cosyvoice: str = Form("true"),
     use_chatterbox: str = Form("false"),
+    use_indic_parler: str = Form("false"),
     use_elevenlabs: str = Form("false"),
     use_google_tts: str = Form("false"),
     use_coqui_xtts: str = Form("false"),
@@ -1255,15 +1516,23 @@ async def create_job_with_srt(
     use_yt_translate: str = Form("false"),
     multi_speaker: str = Form("false"),
     audio_priority: str = Form("true"),
+    audio_untouchable: str = Form("false"),
+    post_tts_level: str = Form("full"),
     audio_bitrate: str = Form("192k"),
     encode_preset: str = Form("veryfast"),
     split_duration: int = Form(0),
+    dub_duration: int = Form(0),
     fast_assemble: str = Form("true"),
     enable_manual_review: str = Form("true"),
     use_whisperx: str = Form("false"),
+    simplify_english: str = Form("true"),
+    step_by_step: str = Form("false"),
+    srt_needs_translation: str = Form("false"),
     voice: str = Form("hi-IN-SwaraNeural"),
 ):
-    """Create a dubbing job from a video (URL or file) + pre-translated SRT file.
+    """Create a dubbing job from a video (URL or file) + SRT file.
+    If srt_needs_translation=true: English SRT → translate → TTS → assembly.
+    If srt_needs_translation=false: Already translated SRT → TTS → assembly.
     Skips transcription and translation — goes straight to TTS + assembly."""
     _cleanup_old_jobs()
 
@@ -1313,6 +1582,7 @@ async def create_job_with_srt(
             mix_original=_bool(mix_original),
             original_volume=original_volume,
             use_cosyvoice=_bool(use_cosyvoice), use_chatterbox=_bool(use_chatterbox),
+            use_indic_parler=_bool(use_indic_parler),
             use_elevenlabs=_bool(use_elevenlabs),
             use_google_tts=_bool(use_google_tts),
             use_coqui_xtts=_bool(use_coqui_xtts),
@@ -1321,12 +1591,18 @@ async def create_job_with_srt(
             use_yt_translate=_bool(use_yt_translate),
             multi_speaker=_bool(multi_speaker),
             audio_priority=_bool(audio_priority),
+            audio_untouchable=_bool(audio_untouchable),
+            post_tts_level=post_tts_level,
             audio_bitrate=audio_bitrate,
             encode_preset=encode_preset,
             split_duration=split_duration,
+            dub_duration=dub_duration,
             fast_assemble=_bool(fast_assemble),
             enable_manual_review=_bool(enable_manual_review),
             use_whisperx=_bool(use_whisperx),
+            simplify_english=_bool(simplify_english),
+            step_by_step=_bool(step_by_step),
+            srt_needs_translation=_bool(srt_needs_translation) if 'srt_needs_translation' in dir() else False,
         )
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -1352,6 +1628,8 @@ def _job_config(job: Job) -> Dict[str, Any]:
         tts = "Hybrid (Coqui+Edge)"
     elif req.use_chatterbox:
         tts = "Chatterbox"
+    elif getattr(req, 'use_indic_parler', False):
+        tts = "Indic Parler-TTS"
     elif req.use_elevenlabs:
         tts = "ElevenLabs"
     elif req.use_cosyvoice:
@@ -1375,9 +1653,23 @@ def _job_config(job: Job) -> Dict[str, Any]:
         "nllb_polish":  "IndicTrans2+",
         "nllb":         "IndicTrans2",
         "chain_dub":    "Chain Dub",
+        "seamless":     "SeamlessM4T v2",
     }
+    # Show actual transcription source, not just Whisper model
+    pipeline_mode = getattr(req, "pipeline_mode", "classic")
+    if pipeline_mode == "new":
+        asr_label = "Parakeet + WhisperX + DP Cues"
+    elif getattr(req, "use_yt_translate", False):
+        asr_label = "YouTube Auto-Translate"
+    elif getattr(req, "prefer_youtube_subs", False):
+        asr_label = "YouTube Subtitles"
+    elif pipeline_mode == "hybrid":
+        asr_label = f"Whisper {getattr(req, 'asr_model', 'large-v3')} + DP Cues"
+    else:
+        asr_label = f"Whisper {getattr(req, 'asr_model', 'large-v3')}"
+
     return {
-        "asr_model": getattr(req, "asr_model", "large-v3"),
+        "asr_model": asr_label,
         "translation_engine": engine_labels.get(getattr(req, "translation_engine", "auto"), "Auto"),
         "tts_engine": tts,
         "audio_priority": getattr(req, "audio_priority", False),
@@ -1451,7 +1743,167 @@ def get_transcript(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    # Prefer live pipeline segments (has latest state during step-by-step review)
+    if job.pipeline_ref and job.pipeline_ref.segments:
+        return {"segments": job.pipeline_ref.segments}
     return {"segments": job.segments}
+
+
+class CompareRequest(BaseModel):
+    engines: List[str] = []  # e.g. ["groq", "gemini", "google"] — empty = all available
+    max_segments: int = 10
+
+
+@app.post("/api/jobs/{job_id}/compare-translations")
+def compare_translations(job_id: str, body: CompareRequest):
+    """Run selected translation engines on a sample of segments for comparison.
+
+    Returns: { engines: { engine_label: [{ text, text_translated }] }, available: [...] }
+    """
+    import copy
+    import traceback
+
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Get segments from pipeline or job
+    segments = []
+    if job.pipeline_ref and job.pipeline_ref.segments:
+        segments = job.pipeline_ref.segments
+    elif job.segments:
+        segments = job.segments
+
+    if not segments:
+        raise HTTPException(status_code=400, detail="No transcribed segments available")
+
+    # Detect available engines
+    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+    sambanova_key = os.environ.get("SAMBANOVA_API_KEY", "").strip()
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+
+    all_engines = {}
+    if groq_key:
+        all_engines["groq"] = "Groq"
+    if sambanova_key:
+        all_engines["sambanova"] = "SambaNova"
+    if gemini_key:
+        all_engines["gemini"] = "Gemini"
+    all_engines["google"] = "Google"
+    if groq_key or sambanova_key or gemini_key:
+        all_engines["google_polish"] = "Google+Polish"
+    # IndicTrans2 (raw local meaning model — no LLM key needed, runs on GPU)
+    all_engines["nllb"] = "IndicTrans2"
+    # IndicTrans2+ (local model + LLM polish — needs at least one LLM key)
+    if groq_key or sambanova_key or gemini_key:
+        all_engines["nllb_polish"] = "IndicTrans2+"
+        all_engines["chain_dub"] = "Chain Dub"
+    if groq_key and sambanova_key:
+        all_engines["turbo"] = "Turbo"
+
+    # If max_segments=0, just return available engines (no translation)
+    if body.max_segments <= 0:
+        return {
+            "engines": {},
+            "segment_count": 0,
+            "available": [{"key": k, "label": v} for k, v in all_engines.items()],
+        }
+
+    sample = [s for s in segments if s.get("text", "").strip()][:body.max_segments]
+    if not sample:
+        raise HTTPException(status_code=400, detail="No text segments found")
+
+    # Filter to selected engines (or use all if none specified)
+    if body.engines:
+        engines_to_run = [(all_engines[k], k) for k in body.engines if k in all_engines]
+    else:
+        engines_to_run = [(label, key) for key, label in all_engines.items()]
+
+    if not engines_to_run:
+        raise HTTPException(status_code=400, detail="No valid engines selected")
+
+    req = job.original_req
+    target_lang = req.target_language if req else "hi"
+    source_lang = (req.source_language if req and req.source_language != "auto" else "en")
+
+    from pipeline import PipelineConfig, Pipeline
+
+    # Reuse existing work dir so IndicTrans2 model cache works
+    work_dir = OUTPUTS / job_id / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    results = {}
+
+    def run_engine(label, engine_key):
+        try:
+            # Redirect stdout/stderr to a UTF-8 string buffer for this thread
+            # This prevents Windows cp1252 crashes when Hindi text is printed
+            import sys as _sys, io as _io
+            _old_stdout, _old_stderr = _sys.stdout, _sys.stderr
+            _sys.stdout = _io.StringIO()
+            _sys.stderr = _io.StringIO()
+            try:
+                cfg = PipelineConfig(
+                    source="compare",
+                    target_language=target_lang,
+                    source_language=source_lang,
+                    translation_engine=engine_key,
+                    work_dir=work_dir,
+                    output_path=work_dir / f"compare_{engine_key}.mp4",
+                )
+                p = Pipeline(cfg)
+                engine_segs = [copy.deepcopy(s) for s in sample]
+                for s in engine_segs:
+                    s.pop("text_translated", None)
+
+                p._translate_segments(engine_segs)
+            finally:
+                _sys.stdout, _sys.stderr = _old_stdout, _old_stderr
+
+            return label, [
+                {"start": s.get("start", 0), "end": s.get("end", 0), "text": s.get("text", ""),
+                 "text_translated": s.get("text_translated", "")}
+                for s in engine_segs
+            ]
+        except Exception as e:
+            try:
+                traceback.print_exc()
+            except Exception:
+                pass
+            return label, [
+                {"start": s.get("start", 0), "end": s.get("end", 0), "text": s.get("text", ""),
+                 "text_translated": f"[ERROR: {str(e)[:80]}]"}
+                for s in sample
+            ]
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    try:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = {pool.submit(run_engine, label, key): label for label, key in engines_to_run}
+            for fut in as_completed(futures):
+                label, translated = fut.result()
+                results[label] = translated
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Compare failed: {str(e)[:200]}")
+
+    return {
+        "engines": results,
+        "segment_count": len(sample),
+        "available": [{"key": k, "label": v} for k, v in all_engines.items()],
+    }
+
+
+@app.post("/api/jobs/{job_id}/continue")
+def continue_job(job_id: str):
+    """Resume a step-by-step job after reviewing transcription or translation."""
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.state not in ("review_transcription", "review_translation"):
+        raise HTTPException(status_code=400, detail=f"Job is not paused for review (state={job.state})")
+    job.state = "running"
+    job.pause_event.set()  # Unblock the pipeline thread
+    return {"status": "resumed", "from_state": job.state}
 
 
 @app.get("/api/jobs/{job_id}/result")
@@ -1558,6 +2010,7 @@ def _run_resume(job: Job):
             tts_rate=req.tts_rate if req else "+0%",
             use_cosyvoice=req.use_cosyvoice if req else True,
             use_chatterbox=req.use_chatterbox if req else False,
+            use_indic_parler=req.use_indic_parler if req else False,
             use_elevenlabs=req.use_elevenlabs if req else False,
             use_google_tts=req.use_google_tts if req else False,
             use_coqui_xtts=req.use_coqui_xtts if req else False,
@@ -1565,12 +2018,16 @@ def _run_resume(job: Job):
             mix_original=req.mix_original if req else False,
             original_volume=req.original_volume if req else 0.10,
             audio_priority=req.audio_priority if req else True,
+            audio_untouchable=getattr(req, 'audio_untouchable', False) if req else False,
+            post_tts_level=getattr(req, 'post_tts_level', 'full') if req else 'full',
             audio_bitrate=req.audio_bitrate if req else "192k",
             encode_preset=req.encode_preset if req else "veryfast",
+            dub_duration=getattr(req, 'dub_duration', 0) if req else 0,
             fast_assemble=req.fast_assemble if req else True,
             multi_speaker=req.multi_speaker if req else False,
             enable_manual_review=req.enable_manual_review if req else True,
             use_whisperx=req.use_whisperx if req else False,
+            simplify_english=req.simplify_english if req else True,
         )
 
         pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job),
@@ -1658,7 +2115,7 @@ async def resume_with_srt(job_id: str, file: UploadFile = File(...)):
     # Send SRT pair to hinglish-ai trainer (fire-and-forget)
     source_srt = work_dir / "transcript_source.srt"
     if source_srt.exists():
-        src_lang = job.original_req.source_language if job.original_req else "en"
+        src_lang = getattr(job.original_req, "source_language", "en") if job.original_req else "en"
         _send_training_data(source_srt, srt_path, source_lang=src_lang)
 
     t = threading.Thread(target=_run_resume, args=(job,), daemon=True)
